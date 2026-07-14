@@ -4,6 +4,47 @@ OpenAI-Compatible Speech Server is a standalone, provider-neutral HTTP service f
 
 This independent project implements a compatible subset of OpenAI's Audio API. It is not affiliated with or endorsed by OpenAI.
 
+## Architecture
+
+```mermaid
+flowchart LR
+    Client[OpenAI-compatible client]
+    Config[Static model and provider config]
+
+    subgraph Node[TypeScript control plane]
+        API[HTTP API and authentication]
+        Validate[Model resolution and extension validation]
+        Input[Upload storage and audio normalization]
+        Queue[Per-model admission queue]
+        Supervisor[Worker supervision and lifecycle]
+        Output[Response framing and streaming]
+    end
+
+    subgraph Runtimes[Persistent provider runtimes]
+        Parakeet[Parakeet STT adapter and model]
+        Kokoro[Kokoro TTS adapter and model]
+        Additional[Additional provider adapter and model]
+    end
+
+    Client --> API
+    Config --> Validate
+    Config --> Supervisor
+    API --> Validate
+    Validate -- transcription --> Input
+    Validate -- speech --> Queue
+    Input --> Queue
+    Queue --> Supervisor
+    Supervisor <-->|versioned JSON-lines protocol| Parakeet
+    Supervisor <-->|versioned JSON-lines protocol| Kokoro
+    Supervisor <-->|versioned JSON-lines protocol| Additional
+    Supervisor -- transcript --> API
+    Supervisor -- audio chunks --> Output
+    Output --> API
+    API --> Client
+```
+
+The control plane owns the public contract, security, validation, input normalization, scheduling, response streaming, and process recovery. Provider workers own model initialization, inference, and provider-specific output normalization, so adding a runtime does not add routes or expose provider configuration to clients.
+
 ## Requirements
 
 - Node.js 22 or newer and npm
