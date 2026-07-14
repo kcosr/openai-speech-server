@@ -1,0 +1,31 @@
+[Unit]
+Description=OpenAI-Compatible Speech Server local speech service
+Documentation=file://@REPO_DIR@/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@REPO_DIR@
+Environment=NODE_ENV=production
+Environment=OPENAI_SPEECH_SERVER_CONFIG=@CONFIG_DIR@/config.yaml
+Environment=HF_HOME=@STATE_DIR@/huggingface
+Environment=TORCH_HOME=@STATE_DIR@/torch
+Environment=XDG_CACHE_HOME=@STATE_DIR@/cache
+Environment=MPLCONFIGDIR=@STATE_DIR@/matplotlib
+ExecStart=@NODE_PATH@ @REPO_DIR@/dist/main.js
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=40s
+KillMode=control-group
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=@STATE_DIR@
+MemoryHigh=24G
+MemoryMax=28G
+UMask=0077
+
+[Install]
+WantedBy=default.target

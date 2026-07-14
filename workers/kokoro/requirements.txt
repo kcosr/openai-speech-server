@@ -1,0 +1,4 @@
+kokoro==0.9.4
+misaki==0.9.4
+numpy==2.4.6
+torch==2.12.0

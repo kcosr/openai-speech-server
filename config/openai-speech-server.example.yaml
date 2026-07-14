@@ -1,0 +1,65 @@
+server:
+  listen: 172.19.116.45:6624
+  request_timeout_seconds: 180
+  stream_idle_timeout_seconds: 30
+  queue_max_depth: 8
+  queue_wait_timeout_seconds: 30
+  max_upload_bytes: 52428800
+  temp_directory: /home/kevin/.local/state/openai-speech-server/tmp
+  ffmpeg: /usr/bin/ffmpeg
+  prlimit: /usr/bin/prlimit
+  ffmpeg_memory_bytes: 2147483648
+  normalization_timeout_seconds: 60
+  shutdown_grace_seconds: 30
+  metrics_enabled: true
+
+auth:
+  tokens_file: /home/kevin/.config/openai-speech-server/tokens.json
+
+models:
+  - id: parakeet-local
+    display_label: Parakeet TDT CTC 110M
+    default: true
+    task: transcription
+    provider: parakeet
+    enabled: true
+    required: true
+    input_formats: [wav, webm, ogg, mp4, mp3]
+    language_auto_detect: true
+    supports_prompt: false
+    provider_config:
+      python: /home/kevin/.venvs/parakeet/bin/python
+      checkpoint: nvidia/parakeet-tdt_ctc-110m
+      device: auto
+      workers: 1
+      cancel_grace_seconds: 300
+      warmup_timeout_seconds: 600
+  - id: kokoro-local
+    display_label: Kokoro
+    default: true
+    task: speech
+    provider: kokoro
+    enabled: true
+    required: true
+    default_voice: af_heart
+    voices: [af_heart, af_sky]
+    output_formats: [pcm, wav]
+    speed: { min: 0.5, max: 2.0, default: 1.0 }
+    sample_rate: 24000
+    channels: 1
+    encoding: pcm_s16le
+    max_text_length: 4096
+    provider_config:
+      python: /home/kevin/.venvs/kokoro/bin/python
+      device: auto
+      workers: 1
+      cancel_grace_seconds: 5
+      warmup_timeout_seconds: 600
+      options:
+        lang_code: a
+
+clients:
+  - id: t3-dev
+    token_ref: t3-dev
+    allowed_models: [parakeet-local, kokoro-local]
+    max_concurrent_requests: 2
