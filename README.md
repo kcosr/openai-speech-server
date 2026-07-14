@@ -7,40 +7,41 @@ This independent project implements a compatible subset of OpenAI's Audio API. I
 ## Architecture
 
 ```mermaid
-flowchart LR
+flowchart TB
     Client[OpenAI-compatible client]
-    Config[Static model and provider config]
+    Config[Static config<br/>models, schemas, provider options]
 
     subgraph Node[TypeScript control plane]
-        API[HTTP API and authentication]
-        Validate[Model resolution and extension validation]
-        Input[Upload storage and audio normalization]
-        Queue[Per-model admission queue]
-        Supervisor[Worker supervision and lifecycle]
-        Output[Response framing and streaming]
+        direction TB
+        API[HTTP API<br/>authentication and streaming]
+        Validate[Resolve model<br/>validate extensions]
+        Input[STT upload<br/>store and normalize]
+        Queue[Per-model queue]
+        Supervisor[Worker supervisor<br/>warmup, cancel, restart]
     end
+
+    Protocol[Versioned JSONL<br/>worker protocol]
 
     subgraph Runtimes[Persistent provider runtimes]
-        Parakeet[Parakeet STT adapter and model]
-        Kokoro[Kokoro TTS adapter and model]
-        Additional[Additional provider adapter and model]
+        direction LR
+        Parakeet[Parakeet<br/>STT adapter and model]
+        Kokoro[Kokoro<br/>TTS adapter and model]
+        Additional[Future provider<br/>adapter and model]
+        Parakeet ~~~ Kokoro ~~~ Additional
     end
 
-    Client --> API
+    Client <--> API
     Config --> Validate
     Config --> Supervisor
     API --> Validate
-    Validate -- transcription --> Input
-    Validate -- speech --> Queue
+    Validate -- STT --> Input
+    Validate -- TTS --> Queue
     Input --> Queue
     Queue --> Supervisor
-    Supervisor <-->|versioned JSON-lines protocol| Parakeet
-    Supervisor <-->|versioned JSON-lines protocol| Kokoro
-    Supervisor <-->|versioned JSON-lines protocol| Additional
-    Supervisor -- transcript --> API
-    Supervisor -- audio chunks --> Output
-    Output --> API
-    API --> Client
+    Supervisor <--> Protocol
+    Protocol <--> Parakeet
+    Protocol <--> Kokoro
+    Protocol <--> Additional
 ```
 
 The control plane owns the public contract, security, validation, input normalization, scheduling, response streaming, and process recovery. Provider workers own model initialization, inference, and provider-specific output normalization, so adding a runtime does not add routes or expose provider configuration to clients.
