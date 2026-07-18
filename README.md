@@ -101,13 +101,11 @@ Raw PCM is signed 16-bit little-endian mono, served as `audio/pcm` with explicit
 
 Readiness stays false until every required provider replica has warmed. Each replica handles one inference at a time; excess work enters a bounded per-model queue. Worker exits and malformed protocol output fail active requests and trigger bounded exponential restart. Configure `warmup_timeout_seconds` per provider to cover model download, load, and device initialization on the target host. Client disconnects request cooperative cancellation. Configure `cancel_grace_seconds` per provider: chunked engines can use a short deadline, while blocking engines should use a deadline longer than their worst expected inference so normal aborts finish without evicting the warm model but genuine hangs still recover.
 
-The service drains HTTP traffic on `SIGTERM`, stops the worker process group, and is forcibly terminated after the configured shutdown deadline. Run a remote deployment check from `srv` with:
+The service drains HTTP traffic on `SIGTERM`, stops the worker process group, and is forcibly terminated after the configured shutdown deadline. Run a deployment smoke check against a reachable server endpoint with:
 
 ```bash
 OPENAI_SPEECH_SERVER_URL=http://192.168.50.72:6624 OPENAI_SPEECH_SERVER_TOKEN=... npm run smoke
 ```
-
-On this WSL host the service binds only `172.19.116.45:6624`. Windows forwards the private-LAN endpoint `192.168.50.72:6624` to that socket, so it does not listen on the Tailscale interface.
 
 GPU/model tests require the real configured environments and are intentionally separate from the deterministic fake-worker test suite run by `npm test`.
 
