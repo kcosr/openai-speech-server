@@ -13,9 +13,9 @@ flowchart TB
 
     subgraph Node[TypeScript control plane]
         direction TB
-        API[HTTP API<br/>authentication and streaming]
+        API[HTTP and WebSocket API<br/>authentication and streaming]
         Validate[Resolve model<br/>validate extensions]
-        Input[STT upload<br/>store and normalize]
+        Input[Uploaded or committed audio<br/>store and normalize]
         Queue[Per-model queue]
         Supervisor[Worker supervisor<br/>warmup, cancel, restart]
     end
@@ -102,6 +102,8 @@ Raw PCM is signed 16-bit little-endian mono, served as `audio/pcm` with explicit
 
 The [protocol reference](docs/realtime.md) documents the supported events, error shapes, and lifecycle.
 
+[Sedes Android](https://github.com/kcosr/sedes/blob/main/docs/operator/clients/voice.md) uses this endpoint for local transcription and `/v1/audio/speech` for playback. In its Voice settings, choose **Own speech server**, enter this server's API base including `/v1`, and save a server token. Select the permitted local models and voice from the discovered catalog; the example configuration names them `parakeet-local` and `kokoro-local`. Hosted OpenAI access is configured directly in Sedes and does not pass through this server.
+
 Connect to `/v1/realtime?intent=transcription` with `Authorization: Bearer <token>`. This implements the current GA transcription event shape without a beta header or beta event aliases. The server sends `session.created` with `audio.input.transcription: null`; select an authorized local model and wait for `session.updated` before recording:
 
 ```json
@@ -119,6 +121,8 @@ Request errors use the standard `error` event, with the causing client `event_id
 The `server.realtime` defaults bound a buffer to 5,760,000 decoded bytes (120 seconds), each JSON message to 1 MiB, pending output to 1 MiB, idle connections to 60 seconds, and session lifetime to one hour. A lower configured model duration also limits each buffer. Realtime normalization derives its output bound from the committed audio duration and WAV overhead, independently of the HTTP upload limit. Buffer overflow fails explicitly and closes the socket; audio is not truncated. Idle timing pauses during inference, which instead uses the existing request deadline and provider cancellation grace. Session expiration and service shutdown cancel owned work. See the [Realtime transcription reference](https://developers.openai.com/api/docs/guides/realtime-transcription) for the standard protocol.
 
 ## Operations
+
+For a reverse proxy, preserve bearer authentication and allow the HTTP/1.1 WebSocket upgrade for `/v1/realtime`. Disable response buffering for streamed speech. If the public API uses a path prefix, strip it before forwarding to this server's `/v1` routes and include it in the client's API base.
 
 Readiness stays false until every required provider replica has warmed. Each replica handles one inference at a time; excess work enters a bounded per-model queue. Worker exits and malformed protocol output fail active requests and trigger bounded exponential restart. Configure `warmup_timeout_seconds` per provider to cover model download, load, and device initialization on the target host. Client disconnects request cooperative cancellation. Configure `cancel_grace_seconds` per provider: chunked engines can use a short deadline, while blocking engines should use a deadline longer than their worst expected inference so normal aborts finish without evicting the warm model but genuine hangs still recover.
 
