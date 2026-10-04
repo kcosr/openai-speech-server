@@ -12,6 +12,12 @@ server:
   normalization_timeout_seconds: 60
   shutdown_grace_seconds: 30
   metrics_enabled: true
+  realtime:
+    max_buffer_bytes: 5760000 # 120 seconds of 24 kHz mono s16le PCM
+    max_message_bytes: 1048576
+    max_output_bytes: 1048576
+    idle_timeout_seconds: 60
+    max_session_seconds: 3600
 
 auth:
   tokens_file: /home/kevin/.config/openai-speech-server/tokens.json
