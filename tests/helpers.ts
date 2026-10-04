@@ -10,7 +10,7 @@ export async function testConfig(serverOverrides: Record<string, unknown> = {}, 
   const tokens = join(directory, "tokens.json");
   await writeFile(tokens, JSON.stringify({ tokens: { test: hashToken(TOKEN) } }), { mode: 0o600 });
   return ConfigSchema.parse({
-    server: { listen: "127.0.0.1:0", temp_directory: directory, ffmpeg: "/usr/bin/ffmpeg", request_timeout_seconds: 5, stream_idle_timeout_seconds: 2, ...serverOverrides },
+    server: { listen: "127.0.0.1:0", temp_directory: directory, ffmpeg: process.env.OPENAI_SPEECH_FFMPEG ?? "/usr/bin/ffmpeg", request_timeout_seconds: 5, stream_idle_timeout_seconds: 2, ...serverOverrides },
     auth: { tokens_file: tokens },
     models: [
       { id: "parakeet-local", task: "transcription", provider: "parakeet", default: true, provider_config: { python: process.env.PYTHON ?? "python3", command: resolve("tests/fixtures/fake_worker.py") } },

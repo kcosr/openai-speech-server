@@ -32,12 +32,17 @@ export async function storeUpload(file: MultipartFile, options: { directory: str
 }
 
 export async function normalizeUpload(upload: StoredUpload, options: { ffmpeg: string; prlimit: string; memoryBytes: number; timeoutMs: number; maxOutputBytes: number }, signal: AbortSignal) {
+  signal.throwIfAborted();
   const ffmpegArgs = ["-nostdin", "-v", "error", "-threads", "1", "-y", "-i", upload.path, "-ac", "1", "-ar", "16000", "-fs", String(options.maxOutputBytes), "-f", "wav", upload.output];
   const child = spawn(options.prlimit, [`--as=${options.memoryBytes}`, "--", options.ffmpeg, ...ffmpegArgs], { stdio: ["ignore", "ignore", "pipe"] });
-  let stderr = ""; child.stderr.on("data", (chunk) => { if (stderr.length < 8192) stderr += chunk; });
-  const timer = setTimeout(() => child.kill("SIGKILL"), options.timeoutMs); const abort = () => child.kill("SIGKILL"); signal.addEventListener("abort", abort, { once: true });
-  const [code] = await once(child, "exit") as [number | null]; clearTimeout(timer); signal.removeEventListener("abort", abort);
+  child.stderr.resume();
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, options.timeoutMs); const abort = () => child.kill("SIGKILL"); signal.addEventListener("abort", abort, { once: true });
+  let code: number | null;
+  try { [code] = await once(child, "close") as [number | null]; }
+  finally { clearTimeout(timer); signal.removeEventListener("abort", abort); }
   if (signal.aborted) throw signal.reason;
+  if (timedOut) throw new ApiError(504, "server_error", "normalization_timeout", "Audio normalization timed out.");
   if (code !== 0) throw new ApiError(400, "invalid_request_error", "invalid_audio", "Audio could not be decoded.", "file");
   const outputBytes = (await stat(upload.output)).size;
   if (outputBytes >= options.maxOutputBytes) throw new ApiError(413, "invalid_request_error", "decoded_audio_too_large", "Decoded audio exceeds the configured limit.", "file");

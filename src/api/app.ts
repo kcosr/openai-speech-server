@@ -1,5 +1,6 @@
 import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
 import multipart from "@fastify/multipart";
+import websocket from "@fastify/websocket";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import type { Config, SpeechModelConfig, TranscriptionModelConfig } from "../config/schema.js";
@@ -9,6 +10,7 @@ import { Registry } from "../runtime/registry.js";
 import { ClientAdmission } from "../runtime/admission.js";
 import { normalizeUpload, storeUpload } from "../media/normalize.js";
 import { Metrics } from "../observability/metrics.js";
+import { registerRealtime } from "./realtime.js";
 
 declare module "fastify" { interface FastifyRequest { client: Client; requestAbort: AbortController } }
 
@@ -28,11 +30,21 @@ const TRANSCRIPTION_FIELDS = new Set(["model", "language", "prompt", "response_f
 export async function buildApp(config: Config, authenticator: Authenticator, registry = new Registry(config)): Promise<FastifyInstance> {
   const app = Fastify({ logger: { redact: ["req.headers.authorization", "headers.authorization"] }, genReqId: () => `req_${randomUUID().replaceAll("-", "")}` });
   const admission = new ClientAdmission(); const metrics = new Metrics();
+  await app.register(websocket, { options: { maxPayload: config.server.realtime.max_message_bytes, perMessageDeflate: false }, preClose: async () => {
+    realtime.close();
+    // Give clients the going-away close frame before bounding unresponsive socket teardown.
+    for (const socket of app.websocketServer.clients) if (socket.readyState === socket.OPEN) socket.close(1001, "Server shutting down");
+    const timer = setTimeout(() => { for (const socket of app.websocketServer.clients) socket.terminate(); }, 1000);
+    try { await new Promise<void>((resolve) => app.websocketServer.close(() => resolve())); } finally { clearTimeout(timer); }
+  } });
+  const upgradeIds = new WeakMap<import("node:http").IncomingMessage, string>();
+  app.websocketServer.on("headers", (headers, request) => { const requestId = upgradeIds.get(request); if (requestId) headers.push(`X-Request-Id: ${requestId}`); });
   await app.register(multipart, { limits: { fileSize: config.server.max_upload_bytes, files: 1, fields: 16 } });
   app.decorateRequest("client"); app.decorateRequest("requestAbort");
   app.addHook("onRequest", async (request, reply) => {
     reply.header("X-Request-Id", request.id); reply.raw.setHeader("X-Request-Id", request.id);
     request.requestAbort = new AbortController();
+    if (request.ws) upgradeIds.set(request.raw, request.id);
     request.raw.once("aborted", () => request.requestAbort.abort(clientDisconnected("upload")));
     reply.raw.once("close", () => { if (!reply.raw.writableFinished) request.requestAbort.abort(clientDisconnected("response")); });
     if (!request.url.startsWith("/health/")) request.client = authenticator.authenticate(request.headers.authorization);
@@ -49,6 +61,7 @@ export async function buildApp(config: Config, authenticator: Authenticator, reg
   app.get("/health/ready", async (_request, reply) => { const failed = [...registry.models.values()].filter(({ config: model, provider }) => model.required && !provider.ready); return failed.length ? reply.code(503).send({ status: "not_ready", providers: failed.map(({ config: model, provider }) => ({ model: model.id, state: provider.state })) }) : { status: "ready" }; });
   app.get("/v1/models", async (request) => ({ object: "list", data: registry.visible(request.client).map(({ config: model }) => ({ id: model.id, object: "model", created: 0, owned_by: "openai-speech-server" })) }));
   app.get("/v1/audio/capabilities", async (request) => registry.capabilities(request.client));
+  const realtime = registerRealtime(app, config, registry, admission);
   app.get("/metrics", async (_request, reply) => {
     if (!config.server.metrics_enabled) throw new ApiError(404, "invalid_request_error", "not_found", "Not found.");
     metrics.providerState.reset();
@@ -117,7 +130,7 @@ export async function buildApp(config: Config, authenticator: Authenticator, reg
   }));
 
   app.addHook("onResponse", async (request, reply) => { const route = request.routeOptions.url ?? "unknown"; metrics.requests.inc({ route, status: String(reply.statusCode) }); metrics.duration.observe({ route }, reply.elapsedTime / 1000); });
-  app.addHook("onClose", async () => registry.stop());
+  app.addHook("onClose", async () => { await registry.stop(); await realtime.drain(); });
   return app;
 }
 

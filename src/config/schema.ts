@@ -64,6 +64,13 @@ export const ConfigSchema = z.strictObject({
     normalization_timeout_seconds: z.number().positive().default(60),
     shutdown_grace_seconds: z.number().positive().default(30),
     metrics_enabled: z.boolean().default(true),
+    realtime: z.strictObject({
+      max_buffer_bytes: z.number().int().min(4800).max(52_428_800).default(5_760_000),
+      max_message_bytes: z.number().int().min(1024).max(16_777_216).default(1_048_576),
+      max_output_bytes: z.number().int().min(1024).max(16_777_216).default(1_048_576),
+      idle_timeout_seconds: z.number().positive().default(60),
+      max_session_seconds: z.number().positive().default(3600),
+    }).default({ max_buffer_bytes: 5_760_000, max_message_bytes: 1_048_576, max_output_bytes: 1_048_576, idle_timeout_seconds: 60, max_session_seconds: 3600 }),
   }),
   auth: z.strictObject({ tokens_file: z.string().min(1) }),
   models: z.array(z.discriminatedUnion("task", [TranscriptionModel, SpeechModel])).nonempty(),
