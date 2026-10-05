@@ -7,6 +7,7 @@ import { ModelQueue } from "./admission.js";
 import { invalid } from "../api/errors.js";
 import { ExtensionValidator } from "../extensions/validator.js";
 import { resolveWorkerCommand } from "../providers/command.js";
+import { realtimeCapability } from "./realtime-limits.js";
 
 export type ModelRuntime = { config: ModelConfig; provider: Provider; queue: ModelQueue; extensions: ExtensionValidator };
 
@@ -43,7 +44,7 @@ export class Registry {
   }
   visible(client: Client) { return [...this.models.values()].filter(({ config }) => client.allowed_models.includes(config.id)); }
   capabilities(client: Client) {
-    return { object: "list", data: this.visible(client).map(({ config: model, provider }) => model.task === "transcription" ? transcriptionCapability(model, provider, this.config.server.max_upload_bytes) : speechCapability(model, provider, client)) };
+    return { object: "list", data: this.visible(client).map(({ config: model, provider }) => model.task === "transcription" ? transcriptionCapability(model, provider, this.config.server) : speechCapability(model, provider, client)) };
   }
   private defaultModelId(task: ModelConfig["task"], client: Client): string {
     const visible = this.visible(client).filter(({ config }) => config.task === task);
@@ -55,7 +56,7 @@ export class Registry {
 }
 
 function base(model: ModelConfig, provider: Provider) { return { id: model.id, task: model.task, display_label: model.display_label ?? model.id, default: model.default, ready: provider.ready, languages: model.languages, extensions: model.extensions }; }
-function transcriptionCapability(model: TranscriptionModelConfig, provider: Provider, maxUploadBytes: number) { return { ...base(model, provider), input_formats: model.input_formats, language_auto_detect: model.language_auto_detect, max_upload_bytes: maxUploadBytes, max_duration_seconds: model.max_duration_seconds ?? null, supports_stream: true, supported_fields: ["file", "model", "language", "prompt", "response_format", "stream", "temperature", "extensions"] }; }
+function transcriptionCapability(model: TranscriptionModelConfig, provider: Provider, server: Config["server"]) { return { ...base(model, provider), input_formats: model.input_formats, language_auto_detect: model.language_auto_detect, max_upload_bytes: server.max_upload_bytes, max_duration_seconds: model.max_duration_seconds ?? null, realtime: realtimeCapability(server.realtime, model), supports_stream: true, supported_fields: ["file", "model", "language", "prompt", "response_format", "stream", "temperature", "extensions"] }; }
 function speechCapability(model: SpeechModelConfig, provider: Provider, client: Client) {
   const voices = allowedSpeechVoices(model, client);
   const defaultVoice = voices.includes(model.default_voice) ? model.default_voice : voices[0];

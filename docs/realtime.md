@@ -173,10 +173,42 @@ Closing the WebSocket aborts queued work and requests cancellation of inference.
 It suppresses later transcript delivery. Synchronous local inference may finish
 before it acknowledges cancellation; the session continues owning its admission
 slot and model resources until the worker settles or the configured cancellation
-grace forces worker recovery. Clients must not replay committed recordings
+grace forces worker recovery. The server provides no durable receipt or
+idempotency guarantee for committed recordings. A client may make bounded
+recognition retries after an uncertain outcome if it accepts repeated inference
+and its cost; the server does not replay work
 automatically after a transport failure.
 
 ## Resource limits
+
+Authenticated `GET /v1/audio/capabilities` includes a required `realtime` object
+on every permitted, enabled transcription model in `data`. Speech models do not
+have this object. Its closed schema has these five required numeric fields:
+
+```json
+{
+  "max_buffer_bytes": 5760000,
+  "max_message_bytes": 1048576,
+  "max_output_bytes": 1048576,
+  "idle_timeout_seconds": 60,
+  "max_session_seconds": 3600
+}
+```
+
+`max_buffer_bytes` is a nonnegative even integer: the smaller of
+`server.realtime.max_buffer_bytes` and the selected model's
+`max_duration_seconds * 48000`, rounded down to a whole PCM16 sample. When a
+model has no duration limit, only the server limit applies. The other fields
+come directly from `server.realtime`: message and output limits are positive
+integers, and time limits are positive seconds, potentially fractional. Very
+small configured model limits are reported as-is, including a zero-byte buffer
+if the duration cannot hold one sample; discovery never raises a limit to make
+a client usable. The WebSocket enforces the same effective buffer bound.
+
+Clients should fetch capabilities for the exact selected model before starting
+recording and compare them with their packet sizes, transcript bounds and
+timing requirements. Picker caches do not establish current recording limits.
+These are derived capability fields, not new operator configuration keys.
 
 | `server.realtime` field | Default | Meaning |
 | --- | --- | --- |
@@ -185,6 +217,16 @@ automatically after a transport failure.
 | `max_output_bytes` | 1,048,576 | Maximum pending outbound data including the next event |
 | `idle_timeout_seconds` | 60 | Idle connection deadline while no job is running |
 | `max_session_seconds` | 3,600 | Session lifetime, including recording and inference |
+
+The lifetime timer starts when the upgraded WebSocket session starts. Measuring
+the advertised lifetime from immediately before the client opens its connection
+gives a conservative deadline without relying on an HTTP `Date` header or the
+client wall clock. Renew between independently tracked recognition jobs when
+the remaining lifetime cannot accommodate another job. A disconnect or expiry
+does not prove a committed job was unused; any client retry is a new recognition
+attempt and may repeat inference. Idle time is reset by
+received application messages, including audio appends, rather than WebSocket
+pings; it pauses while a committed job runs.
 
 At most one committed buffer and one new input buffer exist per session. Client
 concurrency is shared with HTTP, and model queues limit media processing and

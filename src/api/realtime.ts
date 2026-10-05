@@ -6,6 +6,7 @@ import type { Config, TranscriptionModelConfig } from "../config/schema.js";
 import type { Client } from "../auth/auth.js";
 import { ClientAdmission } from "../runtime/admission.js";
 import { Registry, type ModelRuntime } from "../runtime/registry.js";
+import { effectiveRealtimeBufferBytes } from "../runtime/realtime-limits.js";
 import { normalizeUpload, type StoredUpload } from "../media/normalize.js";
 import { REALTIME_BYTES_PER_SECOND, storeRealtimePcm } from "../media/pcm.js";
 import { ApiError, invalid } from "./errors.js";
@@ -142,7 +143,7 @@ class RealtimeSession {
     const chunk = Buffer.from(audio, "base64");
     if (!chunk.length || chunk.length % 2 || chunk.toString("base64") !== audio) throw invalid("invalid_audio", "Audio must contain whole PCM16 samples encoded as canonical base64.", "audio");
     const model = this.settings.runtime.config as TranscriptionModelConfig;
-    const maximum = Math.min(this.config.server.realtime.max_buffer_bytes, model.max_duration_seconds === undefined ? Infinity : Math.floor(model.max_duration_seconds * REALTIME_BYTES_PER_SECOND));
+    const maximum = effectiveRealtimeBufferBytes(this.config.server.realtime, model);
     if (this.bytes + chunk.length > maximum) throw invalid("audio_buffer_overflow", "Audio exceeds the session or model buffer limit.", "audio");
     this.buffer ??= Buffer.alloc(maximum);
     chunk.copy(this.buffer, this.bytes); this.bytes += chunk.length;

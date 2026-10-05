@@ -120,6 +120,23 @@ describe("Realtime transcription over real WebSockets", () => {
     const closed = once(peer.socket, "close"); peer.append(); expect((await peer.next("error")).error.code).toBe("audio_buffer_overflow"); expect((await closed)[0]).toBe(1009);
     const second = await connect(); const oversized = once(second.socket, "close"); second.socket.send("x".repeat(16001)); expect((await oversized)[0]).toBe(1009);
   });
+  it.each(["server", "model"])("enforces the advertised whole-sample %s buffer limit", async (limit) => {
+    const { connect, url } = await boot({ realtime: { max_buffer_bytes: limit === "server" ? 9601 : 48_000 } }, 2, (config) => {
+      if (limit === "model") config.models.find((entry) => entry.task === "transcription")!.max_duration_seconds = 9601 / 48_000;
+    });
+    const response = await fetch(`${url}/v1/audio/capabilities`, { headers: { Authorization: `Bearer ${TOKEN}` } });
+    expect(response.status).toBe(200);
+    const catalog = await response.json() as { data: Array<{ id: string; realtime: { max_buffer_bytes: number } }> };
+    const maximum = catalog.data.find((entry) => entry.id === "parakeet-local")!.realtime.max_buffer_bytes;
+    expect(maximum).toBe(9600);
+    const peer = await connect(); peer.send(configuration()); await peer.next("session.updated");
+    peer.append(Buffer.alloc(maximum)); peer.send({ type: "input_audio_buffer.commit" });
+    expect(await peer.next("conversation.item.input_audio_transcription.completed")).toMatchObject({ usage: { seconds: 0.2 } });
+    const closed = once(peer.socket, "close");
+    peer.append(Buffer.alloc(maximum)); peer.append(Buffer.alloc(2));
+    expect((await peer.next("error")).error.code).toBe("audio_buffer_overflow");
+    expect((await closed)[0]).toBe(1009);
+  });
   it("shares admission with HTTP and releases it after a session closes", async () => {
     const { connect, url } = await boot({}, 1); const peer = await connect();
     await expect(connect()).rejects.toThrow("429");
