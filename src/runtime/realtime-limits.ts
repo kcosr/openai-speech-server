@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { Config, TranscriptionModelConfig } from "../config/schema.js";
+import { MAXIMUM_REALTIME_TIMEOUT_SECONDS, type Config, type TranscriptionModelConfig } from "../config/schema.js";
 import { REALTIME_BYTES_PER_SECOND } from "../media/pcm.js";
 
 /** Public, effective limits for one authorized transcription model. */
@@ -7,8 +7,8 @@ export const RealtimeCapabilitySchema = z.strictObject({
   max_buffer_bytes: z.number().int().nonnegative().multipleOf(2),
   max_message_bytes: z.number().int().positive(),
   max_output_bytes: z.number().int().positive(),
-  idle_timeout_seconds: z.number().positive(),
-  max_session_seconds: z.number().positive(),
+  idle_timeout_seconds: z.number().positive().max(MAXIMUM_REALTIME_TIMEOUT_SECONDS),
+  max_session_seconds: z.number().positive().max(MAXIMUM_REALTIME_TIMEOUT_SECONDS),
 });
 export type RealtimeCapability = z.infer<typeof RealtimeCapabilitySchema>;
 

@@ -200,7 +200,9 @@ have this object. Its closed schema has these five required numeric fields:
 `max_duration_seconds * 48000`, rounded down to a whole PCM16 sample. When a
 model has no duration limit, only the server limit applies. The other fields
 come directly from `server.realtime`: message and output limits are positive
-integers, and time limits are positive seconds, potentially fractional. Very
+integers, and time limits are positive seconds, potentially fractional, up to
+2,147,483 seconds. Larger idle or session settings are rejected at startup
+because Node timers would otherwise expire them immediately. Very
 small configured model limits are reported as-is, including a zero-byte buffer
 if the duration cannot hold one sample; discovery never raises a limit to make
 a client usable. The WebSocket enforces the same effective buffer bound.

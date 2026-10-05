@@ -41,6 +41,22 @@ describe("Realtime transcription over real WebSockets", () => {
     const http = await fetch(`${url}/v1/realtime?intent=transcription`, { headers: { Authorization: `Bearer ${TOKEN}` } }); expect(http.status).toBe(426);
     expect(http.headers.get("upgrade")).toBe("websocket"); expect(http.headers.get("connection")?.toLowerCase()).toBe("upgrade");
   });
+  it("advertises the maximum timer limits and keeps their WebSocket session alive", async () => {
+    const seconds = 2_147_483;
+    const { connect, url } = await boot({ realtime: { idle_timeout_seconds: seconds, max_session_seconds: seconds } });
+    const capability = await fetch(`${url}/v1/audio/capabilities`, { headers: { Authorization: `Bearer ${TOKEN}` } });
+    expect((await capability.json() as any).data.find((model: any) => model.task === "transcription").realtime)
+      .toMatchObject({ idle_timeout_seconds: seconds, max_session_seconds: seconds });
+    const timer = vi.spyOn(globalThis, "setTimeout");
+    const openedAt = Math.floor(Date.now() / 1000);
+    const peer = await connect();
+    const created = await peer.next("session.created");
+    expect(created.session.expires_at).toBeGreaterThanOrEqual(openedAt + seconds);
+    peer.send(configuration());
+    await peer.next("session.updated");
+    expect(peer.socket.readyState).toBe(WebSocket.OPEN);
+    expect(timer.mock.calls.filter(([, delay]) => delay === seconds * 1000).length).toBeGreaterThanOrEqual(2);
+  });
   it("advertises effective GA settings and rejects beta/unsupported updates atomically", async () => {
     const { connect } = await boot(); const peer = await connect();
     expect(await peer.next("session.created")).toMatchObject({ event_id: expect.any(String), session: { type: "transcription", object: "realtime.transcription_session", audio: { input: { transcription: null, format: { type: "audio/pcm", rate: 24000 }, turn_detection: null, noise_reduction: null } } } });
