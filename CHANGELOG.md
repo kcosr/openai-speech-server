@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-11
+
 ### Added
 
 - Local Realtime transcription with bounded recording sessions. ([#1](https://github.com/kcosr/openai-speech-server/pull/1))
