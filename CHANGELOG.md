@@ -2,19 +2,18 @@
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-11
+
 ### Added
 
-- Authorized transcription model capabilities now include effective Realtime
-  buffer, message, output, idle and session limits derived from existing server
-  and model settings. Clients can validate recording limits before capture;
-  buffer limits are rounded down to whole PCM16 samples.
-- OpenAI-compatible Realtime transcription for local speech models, with
-  client-controlled recording commits, final transcript events, and bounded
-  sessions sharing the existing HTTP worker pools. Disconnects cancel owned
-  work without replaying recordings.
-  ([#1](https://github.com/kcosr/openai-speech-server/pull/1))
+- Local Realtime transcription with bounded recording sessions. ([#1](https://github.com/kcosr/openai-speech-server/pull/1))
+- Per-model Realtime recording limits in capability discovery. ([#2](https://github.com/kcosr/openai-speech-server/pull/2))
+
+### Changed
+
+- Add reviewed source-release preparation and publication commands. ([#3](https://github.com/kcosr/openai-speech-server/pull/3))
 
 ### Fixed
 
-- Realtime idle and session limits reject values above 2,147,483 seconds,
-  preventing Node timer overflow from expiring an advertised long session immediately.
+- Update dependencies to resolve reported security advisories. ([#3](https://github.com/kcosr/openai-speech-server/pull/3))
+- Reject Realtime timeouts above 2,147,483 seconds to prevent immediate session expiry. ([#2](https://github.com/kcosr/openai-speech-server/pull/2))

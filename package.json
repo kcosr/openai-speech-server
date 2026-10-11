@@ -1,6 +1,6 @@
 {
   "name": "openai-speech-server",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "engines": {
@@ -12,8 +12,13 @@
     "start": "node dist/main.js",
     "test": "vitest run tests",
     "test:coverage": "vitest run tests --coverage",
-    "check": "tsc -p tsconfig.json --noEmit && vitest run tests",
-    "smoke": "tsx scripts/smoke.ts"
+    "check": "npm run check:version && tsc -p tsconfig.json --noEmit && vitest run tests",
+    "smoke": "tsx scripts/smoke.ts",
+    "check:version": "node scripts/version.mjs check",
+    "version:set": "node scripts/version.mjs set",
+    "release:prepare": "node scripts/release.mjs prepare",
+    "release:publish": "node scripts/release.mjs publish",
+    "test:release": "vitest run tests/release.test.mjs"
   },
   "dependencies": {
     "@fastify/multipart": "^9.2.1",

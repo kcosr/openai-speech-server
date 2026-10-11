@@ -175,3 +175,8 @@ For example, a provider with extra synthesis controls can declare a namespace an
 ```
 
 The client opts into those controls with `"extensions":{"xtts":{"temperature":0.9}}`. Initialization options never come from requests. Provider workers must still normalize speech output to the documented 24 kHz mono s16le contract.
+
+## Releases
+
+See the [changelog](CHANGELOG.md) for user-visible changes and the
+[release process](docs/release-process.md) for preparing and publishing source releases.

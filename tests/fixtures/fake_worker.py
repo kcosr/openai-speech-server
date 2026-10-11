@@ -33,6 +33,13 @@ def run(model, request, cancelled: threading.Event):
         for index in range(count):
             if cancelled.is_set(): return
             yield b"\x00\x01" * (32768 if count > 3 else 128)
+            # Socket tests acknowledge response headers before inducing failure.
+            gate = model.get("options", {}).get("stream_failure_gate")
+            if gate and index == 0 and request.get("input") in ("crash", "fail"):
+                deadline = time.monotonic() + 5
+                while not os.path.exists(gate):
+                    if cancelled.wait(0.01): return
+                    if time.monotonic() >= deadline: raise RuntimeError("stream failure gate timed out")
             if request.get("input") == "crash" and index == 0: os._exit(1)
             if request.get("input") == "fail" and index == 0: raise RuntimeError("synthetic stream failure")
             time.sleep(0.005)
