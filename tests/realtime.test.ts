@@ -41,6 +41,22 @@ describe("Realtime transcription over real WebSockets", () => {
     const http = await fetch(`${url}/v1/realtime?intent=transcription`, { headers: { Authorization: `Bearer ${TOKEN}` } }); expect(http.status).toBe(426);
     expect(http.headers.get("upgrade")).toBe("websocket"); expect(http.headers.get("connection")?.toLowerCase()).toBe("upgrade");
   });
+  it("advertises the maximum timer limits and keeps their WebSocket session alive", async () => {
+    const seconds = 2_147_483;
+    const { connect, url } = await boot({ realtime: { idle_timeout_seconds: seconds, max_session_seconds: seconds } });
+    const capability = await fetch(`${url}/v1/audio/capabilities`, { headers: { Authorization: `Bearer ${TOKEN}` } });
+    expect((await capability.json() as any).data.find((model: any) => model.task === "transcription").realtime)
+      .toMatchObject({ idle_timeout_seconds: seconds, max_session_seconds: seconds });
+    const timer = vi.spyOn(globalThis, "setTimeout");
+    const openedAt = Math.floor(Date.now() / 1000);
+    const peer = await connect();
+    const created = await peer.next("session.created");
+    expect(created.session.expires_at).toBeGreaterThanOrEqual(openedAt + seconds);
+    peer.send(configuration());
+    await peer.next("session.updated");
+    expect(peer.socket.readyState).toBe(WebSocket.OPEN);
+    expect(timer.mock.calls.filter(([, delay]) => delay === seconds * 1000).length).toBeGreaterThanOrEqual(2);
+  });
   it("advertises effective GA settings and rejects beta/unsupported updates atomically", async () => {
     const { connect } = await boot(); const peer = await connect();
     expect(await peer.next("session.created")).toMatchObject({ event_id: expect.any(String), session: { type: "transcription", object: "realtime.transcription_session", audio: { input: { transcription: null, format: { type: "audio/pcm", rate: 24000 }, turn_detection: null, noise_reduction: null } } } });
@@ -119,6 +135,23 @@ describe("Realtime transcription over real WebSockets", () => {
     const { connect } = await boot({ realtime: { max_buffer_bytes: 4800, max_message_bytes: 16000 } }); const peer = await connect(); peer.send(configuration()); await peer.next("session.updated");
     const closed = once(peer.socket, "close"); peer.append(); expect((await peer.next("error")).error.code).toBe("audio_buffer_overflow"); expect((await closed)[0]).toBe(1009);
     const second = await connect(); const oversized = once(second.socket, "close"); second.socket.send("x".repeat(16001)); expect((await oversized)[0]).toBe(1009);
+  });
+  it.each(["server", "model"])("enforces the advertised whole-sample %s buffer limit", async (limit) => {
+    const { connect, url } = await boot({ realtime: { max_buffer_bytes: limit === "server" ? 9601 : 48_000 } }, 2, (config) => {
+      if (limit === "model") config.models.find((entry) => entry.task === "transcription")!.max_duration_seconds = 9601 / 48_000;
+    });
+    const response = await fetch(`${url}/v1/audio/capabilities`, { headers: { Authorization: `Bearer ${TOKEN}` } });
+    expect(response.status).toBe(200);
+    const catalog = await response.json() as { data: Array<{ id: string; realtime: { max_buffer_bytes: number } }> };
+    const maximum = catalog.data.find((entry) => entry.id === "parakeet-local")!.realtime.max_buffer_bytes;
+    expect(maximum).toBe(9600);
+    const peer = await connect(); peer.send(configuration()); await peer.next("session.updated");
+    peer.append(Buffer.alloc(maximum)); peer.send({ type: "input_audio_buffer.commit" });
+    expect(await peer.next("conversation.item.input_audio_transcription.completed")).toMatchObject({ usage: { seconds: 0.2 } });
+    const closed = once(peer.socket, "close");
+    peer.append(Buffer.alloc(maximum)); peer.append(Buffer.alloc(2));
+    expect((await peer.next("error")).error.code).toBe("audio_buffer_overflow");
+    expect((await closed)[0]).toBe(1009);
   });
   it("shares admission with HTTP and releases it after a session closes", async () => {
     const { connect, url } = await boot({}, 1); const peer = await connect();

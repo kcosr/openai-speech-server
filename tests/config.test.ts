@@ -8,6 +8,13 @@ import YAML from "yaml";
 
 const base = { server: { listen: "127.0.0.1:1" }, auth: { tokens_file: "/x" }, models: [{ id: "speech", task: "speech", provider: "kokoro", default_voice: "a", voices: ["a"], output_formats: ["pcm"], provider_config: { python: "python3" } }], clients: [{ id: "client", token_ref: "x", allowed_models: ["speech"] }] };
 describe("configuration", () => {
+  it.each(["idle_timeout_seconds", "max_session_seconds"] as const)("bounds Realtime %s to enforceable Node timer delays", field => {
+    const parse = (seconds: number) => ConfigSchema.parse({ ...base, server: { ...base.server, realtime: { [field]: seconds } } });
+    expect(parse(2_147_483).server.realtime[field]).toBe(2_147_483);
+    expect(parse(0.25).server.realtime[field]).toBe(0.25);
+    expect(() => parse(2_147_484)).toThrow();
+    expect(() => parse(2_592_000)).toThrow();
+  });
   it("applies strict defaults", () => { const config = ConfigSchema.parse(base); expect(config.server.queue_max_depth).toBe(8); expect(config.models[0]?.enabled).toBe(true); expect(config.models[0]?.extensions).toEqual({}); expect(config.models[0]?.provider_config.options).toEqual({}); expect(config.models[0]?.provider_config.warmup_timeout_seconds).toBe(120); });
   it("rejects unknown fields", () => expect(() => ConfigSchema.parse({ ...base, legacy: true })).toThrow());
   it("rejects duplicate IDs", () => expect(() => ConfigSchema.parse({ ...base, models: [...base.models, ...base.models] })).toThrow(/Duplicate model/));

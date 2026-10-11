@@ -1,5 +1,8 @@
 import { z } from "zod";
 
+// Node clamps larger setTimeout delays to 1 ms; keep advertised deadlines enforceable.
+export const MAXIMUM_REALTIME_TIMEOUT_SECONDS = 2_147_483;
+
 const ProviderConfig = z.strictObject({
   python: z.string().min(1),
   checkpoint: z.string().min(1).optional(),
@@ -68,8 +71,8 @@ export const ConfigSchema = z.strictObject({
       max_buffer_bytes: z.number().int().min(4800).max(52_428_800).default(5_760_000),
       max_message_bytes: z.number().int().min(1024).max(16_777_216).default(1_048_576),
       max_output_bytes: z.number().int().min(1024).max(16_777_216).default(1_048_576),
-      idle_timeout_seconds: z.number().positive().default(60),
-      max_session_seconds: z.number().positive().default(3600),
+      idle_timeout_seconds: z.number().positive().max(MAXIMUM_REALTIME_TIMEOUT_SECONDS).default(60),
+      max_session_seconds: z.number().positive().max(MAXIMUM_REALTIME_TIMEOUT_SECONDS).default(3600),
     }).default({ max_buffer_bytes: 5_760_000, max_message_bytes: 1_048_576, max_output_bytes: 1_048_576, idle_timeout_seconds: 60, max_session_seconds: 3600 }),
   }),
   auth: z.strictObject({ tokens_file: z.string().min(1) }),

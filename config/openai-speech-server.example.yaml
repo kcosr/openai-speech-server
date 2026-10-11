@@ -12,12 +12,14 @@ server:
   normalization_timeout_seconds: 60
   shutdown_grace_seconds: 30
   metrics_enabled: true
+  # These existing settings are published in each authorized transcription
+  # model's capabilities.realtime object. Clients use them before recording.
   realtime:
-    max_buffer_bytes: 5760000 # 120 seconds of 24 kHz mono s16le PCM
+    max_buffer_bytes: 5760000 # 120 seconds of 24 kHz mono s16le; lower model duration applies, rounded down to two bytes
     max_message_bytes: 1048576
     max_output_bytes: 1048576
     idle_timeout_seconds: 60
-    max_session_seconds: 3600
+    max_session_seconds: 3600 # Measured from the upgraded session's start
 
 auth:
   tokens_file: /home/kevin/.config/openai-speech-server/tokens.json
@@ -33,6 +35,8 @@ models:
     input_formats: [wav, webm, ogg, mp4, mp3]
     language_auto_detect: true
     supports_prompt: false
+    # Optional existing model bound, also applied to capabilities.realtime.max_buffer_bytes:
+    # max_duration_seconds: 120
     provider_config:
       python: /home/kevin/.venvs/parakeet/bin/python
       checkpoint: nvidia/parakeet-tdt_ctc-110m
