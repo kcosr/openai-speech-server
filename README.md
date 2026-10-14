@@ -159,12 +159,13 @@ clients that explicitly select a set. Selection belongs to the authenticated
 client identity; devices sharing that identity receive the same corrections.
 Clients cannot select or edit rule sets through audio API requests.
 
-Patterns use [RE2 syntax](https://github.com/google/re2/wiki/Syntax), including
-alternatives (`a|b`), groups, character classes, and repetition. Lookaround and
-pattern backreferences are unsupported; raw-byte `\C` matching is forbidden.
-Patterns are Unicode-aware, but `\b`
-and `\w` use ASCII word characters; use explicit character classes or Unicode
-properties such as `\p{L}` for other alphabets. YAML single-quoted strings
+Patterns use [RE2 syntax](https://github.com/google/re2/wiki/Syntax)
+through RE2JS, including alternatives (`a|b`), groups, character classes, and
+repetition. Lookaround, pattern backreferences, and raw-byte `\C` matching are
+unsupported. JavaScript regex escapes are not translated; use literal Unicode
+characters or RE2 escapes such as `\x{1F600}`. Patterns are Unicode-aware, but
+`\b` and `\w` use ASCII word characters; use explicit character classes or
+Unicode properties such as `\p{L}` for other alphabets. YAML single-quoted strings
 preserve regex backslashes. Matching is case insensitive by default; set
 `case_insensitive: false` for an exact-case rule.
 
@@ -180,10 +181,15 @@ transcription without returning a partially corrected result.
 Configuration allows 32 sets with up to 100 rules each. Set names and rule IDs
 use lowercase letters, digits, dots, underscores, or hyphens, start with a letter
 or digit, and are at most 64 characters. Patterns and replacements are each
-limited to 1,024 UTF-16 code units. When a nonempty set is active, input and
-corrected output are each limited to 65,536 UTF-8 bytes; matching is also bounded
-to 4,096 candidate matches and 16 MiB of cumulative regex input processing.
-Exceeding a limit fails the transcription rather than truncating text.
+limited to 1,024 UTF-16 code units. Compiled regex programs are limited to 4,096
+instructions per rule and 262,144 instructions across all configured sets;
+oversized expressions or dictionaries are rejected at startup. When a nonempty
+set is active, input and corrected output are each limited to 65,536 UTF-8 bytes;
+matching is also bounded to 4,096 candidate matches, including discarded
+overlapping candidates.
+Exceeding a limit or receiving a malformed Unicode transcript fails the
+transcription without returning partial output. Patterns and replacements must
+also contain well-formed Unicode.
 Disabled substitutions and empty rule sets leave text unchanged without these
 transcript processing limits.
 
@@ -201,7 +207,8 @@ printf '%s' 'Open seedus and then seedes.' | env -u NODE_ENV npm run --silent pr
 Add `--client t3-dev` to preview that configured client's effective selection.
 Without `--client`, the command uses the server default. It requires an explicit
 `--config` path, accepts at most 65,536 bytes of UTF-8 from stdin, and preserves
-sample whitespace. The command validates configuration and patterns offline;
+sample whitespace. The result is one compact JSON line, including escaped sample
+newlines. The command validates configuration and patterns offline;
 it does not load models, open a network listener, or require installed Python,
 ffmpeg, or token files. Errors produce a nonzero exit status and no result JSON.
 

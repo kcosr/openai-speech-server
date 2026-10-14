@@ -133,8 +133,8 @@ disables substitutions or selects another set. This uses the same processing as
 HTTP transcription and adds no session settings or protocol fields. Corrections
 apply independently to each committed audio buffer, so a pattern cannot span
 commits. Duration-based usage still describes the original audio. A correction
-limit or unsupported zero-length match fails the committed item instead of
-returning partial output.
+limit, malformed Unicode transcript, or unsupported zero-length match fails the
+committed item instead of returning partial output.
 
 One committed job may be pending per session. A second commit while it is
 pending fails with `transcription_busy` and leaves the next input buffer intact.

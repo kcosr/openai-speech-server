@@ -52,7 +52,7 @@ async function main(): Promise<void> {
   const substitutions = new TranscriptSubstitutions(config.transcription_substitutions);
   const transcript = await readTranscript();
   const result = substitutions.apply(transcript, client?.transcription_rule_set);
-  process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  process.stdout.write(`${JSON.stringify(result)}\n`);
 }
 
 main().catch(error => {

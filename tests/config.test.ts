@@ -58,7 +58,7 @@ describe("transcription substitution configuration", () => {
     expect(() => parse({ ...substitutions, rule_sets: { common: [rule], other: [rule] } })).not.toThrow();
   });
 
-  it.each(["(", "a(?=b)", "(?<=a)b", "(a)\\1", "\\C"])("rejects invalid or unsupported expressions in unused rule sets: %s", pattern => {
+  it.each(["(", "a(?=b)", "(?<=a)b", "(a)\\1", "\\C", String.raw`\c\Q|\C`, String.raw`\u0061`])("rejects invalid or unsupported expressions in unused rule sets: %s", pattern => {
     expect(() => parse({ rule_sets: { unused: [{ ...rule, pattern }] } })).toThrow(/RE2/);
   });
 
@@ -77,6 +77,21 @@ describe("transcription substitution configuration", () => {
     expect(() => parse({ rule_sets: { ["a".repeat(65)]: [] } })).toThrow();
     expect(() => parse({ rule_sets: { common: [{ ...rule, id: "a".repeat(65) }] } })).toThrow();
   });
+
+  it("rejects malformed Unicode patterns and replacement text", () => {
+    for (const field of ["pattern", "replacement"]) {
+      expect(() => parse({ rule_sets: { common: [{ ...rule, [field]: "\ud800" }] } })).toThrow(/well-formed Unicode/);
+      expect(() => parse({ rule_sets: { common: [{ ...rule, [field]: "\udc00" }] } })).toThrow(/well-formed Unicode/);
+    }
+  });
+
+  it("bounds compiled programs per expression and across every rule set", () => {
+    expect(() => parse({ rule_sets: { common: [{ ...rule, pattern: "(?:abcde){1000}" }] } })).toThrow(/4096-instruction/);
+    const maximumProgramRule = { ...rule, pattern: "(?:abcd){1000}q{94}" };
+    expect(() => parse({ rule_sets: { common: [maximumProgramRule] } })).not.toThrow();
+    const rule_sets = { common: Array.from({ length: 65 }, (_, index) => ({ ...maximumProgramRule, id: `rule-${index}` })) };
+    expect(() => parse({ rule_sets })).toThrow(/262144-instruction total/);
+  }, 15_000);
 
   it("rejects alias fields and unknown options", () => {
     expect(() => parse({ default: "common", rule_sets: {} })).toThrow();

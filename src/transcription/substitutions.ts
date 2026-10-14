@@ -1,4 +1,4 @@
-import { RE2 } from "re2-wasm";
+import { RE2JS, type Matcher } from "re2js";
 import { ApiError } from "../api/errors.js";
 import type { Config } from "../config/schema.js";
 
@@ -7,11 +7,12 @@ export const MAX_RULES_PER_SET = 100;
 export const MAX_RULE_TEXT_LENGTH = 1024;
 export const MAX_TRANSCRIPT_BYTES = 65_536;
 export const MAX_SUBSTITUTION_MATCHES = 4096;
-export const MAX_SUBSTITUTION_WORK_BYTES = 16 * 1024 * 1024;
+export const MAX_RULE_PROGRAM_SIZE = 4096;
+export const MAX_TOTAL_PROGRAM_SIZE = 262_144;
 
 type RuleConfig = Config["transcription_substitutions"]["rule_sets"][string][number];
-type CompiledRule = { config: RuleConfig; expression: RE2 };
-type Candidate = { start: number; end: number; endCodePoint: number };
+type CompiledRule = { config: RuleConfig; expression: RE2JS };
+type Candidate = { start: number; end: number };
 
 export interface SubstitutionResult {
   text: string;
@@ -19,50 +20,54 @@ export interface SubstitutionResult {
   matches: Array<{ ruleId: string; count: number }>;
 }
 
-function compile(pattern: string, caseInsensitive: boolean): RE2 {
-  return new RE2(pattern, caseInsensitive ? "giu" : "gu");
+function compile(pattern: string, caseInsensitive: boolean): RE2JS {
+  return RE2JS.compile(pattern, caseInsensitive ? RE2JS.CASE_INSENSITIVE : 0);
+}
+
+export function isWellFormedUnicode(text: string): boolean {
+  for (let index = 0; index < text.length; index++) {
+    const unit = text.charCodeAt(index);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = text.charCodeAt(++index);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) return false;
+  }
+  return true;
 }
 
 /** Reject unsupported syntax and common empty-match expressions at startup. */
-export function validateSubstitutionPattern(pattern: string, caseInsensitive: boolean): string | undefined {
-  if (pattern.length > MAX_RULE_TEXT_LENGTH) return "Substitution expression exceeds the configured length limit";
-  let quoted = false;
-  for (let index = 0; index < pattern.length; index++) {
-    if (pattern[index] !== "\\") continue;
-    const escaped = pattern[index + 1];
-    if (quoted) {
-      if (escaped === "E") { quoted = false; index++; }
-    } else {
-      // RE2's raw-byte escape can split UTF-8 characters; this binding only
-      // exposes code-point offsets. Escaped backslashes and quoted text are safe.
-      if (escaped === "C") return "The RE2 raw-byte escape is not supported";
-      if (escaped === "Q") quoted = true;
-      index++;
-    }
-  }
-  let expression: RE2;
+export function inspectSubstitutionPattern(pattern: string, caseInsensitive: boolean): { error?: string; programSize: number } {
+  if (pattern.length > MAX_RULE_TEXT_LENGTH) return { error: "Substitution expression exceeds the configured length limit", programSize: 0 };
+  if (!isWellFormedUnicode(pattern)) return { error: "Substitution expressions must contain well-formed Unicode", programSize: 0 };
+  let expression: RE2JS;
   try {
     expression = compile(pattern, caseInsensitive);
   } catch {
     // Engine diagnostics include the expression, which may contain private vocabulary.
-    return "Invalid or unsupported RE2 expression";
+    return { error: "Invalid or unsupported RE2 expression", programSize: 0 };
   }
+  const programSize = expression.programSize();
+  if (programSize > MAX_RULE_PROGRAM_SIZE) return { error: `Substitution expression exceeds the ${MAX_RULE_PROGRAM_SIZE}-instruction compiled program limit`, programSize };
   // Empty matches can depend on anchors or word boundaries. These probes cover
   // those common cases; the runtime also rejects any empty match it encounters.
   for (const probe of ["", "a", " ", "\n", "aa a\na !a!\n\n"]) {
-    expression.lastIndex = 0;
-    let match;
-    while ((match = expression.exec(probe))) {
-      if (!match[0]) return "Substitution expressions must not match empty text";
-      // re2-wasm indices are code points, despite its UTF-16 lastIndex update.
-      expression.lastIndex = match.index + Array.from(match[0]).length;
+    const matcher = expression.matcher(probe);
+    while (matcher.find()) {
+      if (matcher.start() === matcher.end()) return { error: "Substitution expressions must not match empty text", programSize };
     }
   }
-  return undefined;
+  return { programSize };
 }
 
 function failure(code: string, message: string): ApiError {
   return new ApiError(500, "server_error", `transcription_substitution_${code}`, message);
+}
+
+function isUnicodeBoundary(text: string, index: number): boolean {
+  if (index <= 0 || index >= text.length) return true;
+  const previous = text.charCodeAt(index - 1);
+  const next = text.charCodeAt(index);
+  return !(previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff);
 }
 
 /** Applies one configured dictionary to the original final transcript. */
@@ -85,33 +90,25 @@ export class TranscriptSubstitutions {
     if (rules.length === 0) return { text, ruleSet, matches: [] };
     const inputBytes = Buffer.byteLength(text, "utf8");
     if (inputBytes > MAX_TRANSCRIPT_BYTES) throw failure("input_limit", "The transcript exceeds the substitution input limit");
+    if (!isWellFormedUnicode(text)) throw failure("invalid_unicode", "The transcript contains malformed Unicode");
 
-    // re2-wasm returns code-point offsets. Translate them before slicing JS
-    // strings, and override its lastIndex after every search (astral matches
-    // otherwise advance by the wrong number of code points).
-    const utf16Offsets = [0];
-    for (const character of text) utf16Offsets.push(utf16Offsets[utf16Offsets.length - 1]! + character.length);
-
-    let workBytes = 0;
+    // Matchers retain the original UTF-16 string without copying or re-encoding
+    // it. Group-zero offsets are directly usable by JavaScript string slicing.
+    const matchers = rules.map(rule => rule.expression.matcher(text));
     let candidateCount = 0;
-    const search = (rule: CompiledRule, fromCodePoint: number): Candidate | null => {
-      // Every exec converts the full string into WASM memory, even when it starts
-      // at a later offset. Bound that aggregate work as well as match count.
-      workBytes += inputBytes;
-      if (workBytes > MAX_SUBSTITUTION_WORK_BYTES) throw failure("work_limit", "The transcript exceeds the substitution processing limit");
-      rule.expression.lastIndex = fromCodePoint;
-      const match = rule.expression.exec(text);
-      if (!match) return null;
-      if (!match[0]) throw failure("empty_match", "A transcription substitution expression matched empty text");
+    const search = (matcher: Matcher, from: number): Candidate | null => {
+      if (!matcher.find(from)) return null;
+      const start = matcher.start();
+      const end = matcher.end();
+      // Escaped surrogate literals can trigger a RE2JS literal fast path that
+      // splits a valid pair. Reject those spans instead of corrupting Unicode.
+      if (!isUnicodeBoundary(text, start) || !isUnicodeBoundary(text, end)) throw failure("invalid_match", "A transcription substitution expression returned invalid text offsets");
+      if (start === end) throw failure("empty_match", "A transcription substitution expression matched empty text");
       if (++candidateCount > MAX_SUBSTITUTION_MATCHES) throw failure("work_limit", "The transcript exceeds the substitution processing limit");
-      const endCodePoint = match.index + Array.from(match[0]).length;
-      const start = utf16Offsets[match.index];
-      const end = utf16Offsets[endCodePoint];
-      if (start === undefined || end === undefined || text.slice(start, end) !== match[0]) throw failure("invalid_match", "A transcription substitution expression returned invalid text offsets");
-      return { start, end, endCodePoint };
+      return { start, end };
     };
 
-    const candidates = rules.map(rule => search(rule, 0));
+    const candidates = matchers.map(matcher => search(matcher, 0));
     const counts = rules.map(() => 0);
     const chunks: string[] = [];
     let cursor = 0;
@@ -138,7 +135,7 @@ export class TranscriptSubstitutions {
         // Search again after an overlap: a discarded match might hide another
         // valid occurrence starting at the new cursor. Keep the full original
         // string so ^ and word boundaries retain their original context.
-        if (candidates[index] && candidates[index]!.start < cursor) candidates[index] = search(rules[index]!, candidate.endCodePoint);
+        if (candidates[index] && candidates[index]!.start < cursor) candidates[index] = search(matchers[index]!, cursor);
       }
     }
     append(text.slice(cursor));

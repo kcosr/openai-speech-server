@@ -39,11 +39,13 @@ describe("offline substitution preview", () => {
     });
   }
 
-  it("previews default corrections and counts without installed model, media, or token files", () => {
+  it("prints one JSON line with corrections and counts without installed model, media, or token files", () => {
     const result = preview("Use SEEDUS and seedes.\n");
     expect(result.status, result.stderr).toBe(0);
     expect(result.stderr).toBe("");
-    expect(JSON.parse(result.stdout)).toEqual({ text: "Use Sedes and Sedes.\n", ruleSet: "common", matches: [{ ruleId: "app-name", count: 2 }] });
+    const expected = { text: "Use Sedes and Sedes.\n", ruleSet: "common", matches: [{ ruleId: "app-name", count: 2 }] };
+    expect(JSON.parse(result.stdout)).toEqual(expected);
+    expect(result.stdout).toBe(`${JSON.stringify(expected)}\n`);
   });
 
   it.each([
