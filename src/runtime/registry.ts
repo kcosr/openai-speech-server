@@ -1,6 +1,6 @@
 import type { Config, ModelConfig, SpeechModelConfig, TranscriptionModelConfig } from "../config/schema.js";
 import type { Client } from "../auth/auth.js";
-import type { Provider, SpeechProvider, TranscriptionProvider } from "../providers/types.js";
+import type { Provider, SpeechProvider, TranscriptRequest, TranscriptResult, TranscriptionProvider } from "../providers/types.js";
 import { PythonSpeechProvider, PythonTranscriptionProvider } from "../providers/python.js";
 import { WorkerSupervisor } from "../providers/supervisor.js";
 import { ModelQueue } from "./admission.js";
@@ -8,12 +8,15 @@ import { invalid } from "../api/errors.js";
 import { ExtensionValidator } from "../extensions/validator.js";
 import { resolveWorkerCommand } from "../providers/command.js";
 import { realtimeCapability } from "./realtime-limits.js";
+import { TranscriptSubstitutions } from "../transcription/substitutions.js";
 
 export type ModelRuntime = { config: ModelConfig; provider: Provider; queue: ModelQueue; extensions: ExtensionValidator };
 
 export class Registry {
   readonly models = new Map<string, ModelRuntime>();
+  private readonly substitutions: TranscriptSubstitutions;
   constructor(private readonly config: Config) {
+    this.substitutions = new TranscriptSubstitutions(config.transcription_substitutions);
     for (const model of config.models) {
       const extensions = new ExtensionValidator(model.id, model.extensions);
       if (!model.enabled) continue;
@@ -34,6 +37,11 @@ export class Registry {
     return runtime;
   }
   transcription(runtime: ModelRuntime) { return runtime.provider as TranscriptionProvider; }
+  async transcribe(runtime: ModelRuntime, client: Client, request: TranscriptRequest, signal: AbortSignal): Promise<TranscriptResult> {
+    const result = await this.transcription(runtime).transcribe(request, signal);
+    signal.throwIfAborted();
+    return { ...result, text: this.substitutions.apply(result.text, client.transcription_rule_set).text };
+  }
   speech(runtime: ModelRuntime) { return runtime.provider as SpeechProvider; }
   resolveVoice(model: SpeechModelConfig, client: Client, requested: string | undefined): string {
     const allowed = allowedSpeechVoices(model, client);

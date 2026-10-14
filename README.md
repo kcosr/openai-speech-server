@@ -122,6 +122,97 @@ The `server.realtime` defaults bound a buffer to 5,760,000 decoded bytes (120 se
 
 Every authorized transcription entry in `GET /v1/audio/capabilities` includes a required `realtime` object with `max_buffer_bytes`, `max_message_bytes`, `max_output_bytes`, `idle_timeout_seconds`, and `max_session_seconds`. These are effective limits derived from the existing configuration, not additional settings. The buffer is the smaller of the server buffer and the model's `max_duration_seconds` at 48,000 PCM bytes per second, rounded down to a whole two-byte sample. Clients should discover the selected model's limits before recording and reject configurations they cannot support. The session lifetime starts after the WebSocket upgrade; a client can conservatively budget it from immediately before opening the connection, without comparing wall clocks. See [resource limits](docs/realtime.md#resource-limits) for the complete capability contract.
 
+## Transcription substitutions
+
+Configure recurring recognition corrections once in the server's YAML. The
+default rule set applies automatically to every client, including newly added
+clients. Omit `transcription_substitutions` to leave transcripts unchanged.
+For example, this maps three variations to one phrase:
+
+```yaml
+transcription_substitutions:
+  default_rule_set: vocabulary
+  rule_sets:
+    vocabulary:
+      - id: app-name
+        pattern: '\b(?:seedes|seedus|sedus)\b'
+        replacement: 'Sedes'
+        case_insensitive: true
+```
+
+Rules apply after model inference and before the final response, consistently
+across HTTP JSON, text, SSE, and Realtime transcription. They do not change
+speech synthesis. Configuration is validated at startup; restart the server
+after changing rules or client selections.
+
+No client setting is needed for the default. For exceptions, set a field on an
+existing entry in `clients`:
+
+| `transcription_rule_set` | Effect |
+| --- | --- |
+| Omitted | Use `transcription_substitutions.default_rule_set` |
+| `null` | Disable substitutions for this client |
+| A rule set name, such as `technical` | Use that set in place of the default |
+
+The global `default_rule_set` may also be `null` (its default), enabling only
+clients that explicitly select a set. Selection belongs to the authenticated
+client identity; devices sharing that identity receive the same corrections.
+Clients cannot select or edit rule sets through audio API requests.
+
+Patterns use [RE2 syntax](https://github.com/google/re2/wiki/Syntax), including
+alternatives (`a|b`), groups, character classes, and repetition. Lookaround and
+pattern backreferences are unsupported; raw-byte `\C` matching is forbidden.
+Patterns are Unicode-aware, but `\b`
+and `\w` use ASCII word characters; use explicit character classes or Unicode
+properties such as `\p{L}` for other alphabets. YAML single-quoted strings
+preserve regex backslashes. Matching is case insensitive by default; set
+`case_insensitive: false` for an exact-case rule.
+
+Each rule's `replacement` is literal text: `$1` and backslashes do not expand
+captures. All matching uses the original transcript, so replacement text does
+not trigger another correction. Nonoverlapping matches are replaced throughout
+the transcript. The earliest match wins an overlap; when matches start at the
+same position, the earlier rule in the configured list wins. Rule IDs must be
+unique within a set. Zero-length matches are unsupported: detected expressions
+are rejected during startup, and any encountered at runtime fail the
+transcription without returning a partially corrected result.
+
+Configuration allows 32 sets with up to 100 rules each. Set names and rule IDs
+use lowercase letters, digits, dots, underscores, or hyphens, start with a letter
+or digit, and are at most 64 characters. Patterns and replacements are each
+limited to 1,024 UTF-16 code units. When a nonempty set is active, input and
+corrected output are each limited to 65,536 UTF-8 bytes; matching is also bounded
+to 4,096 candidate matches and 16 MiB of cumulative regex input processing.
+Exceeding a limit fails the transcription rather than truncating text.
+Disabled substitutions and empty rule sets leave text unchanged without these
+transcript processing limits.
+
+Preview a sample before restarting:
+
+```bash
+printf '%s' 'Open seedus and then seedes.' | env -u NODE_ENV npm run --silent preview:substitutions -- \
+  --config "$HOME/.config/openai-speech-server/config.yaml"
+```
+
+```json
+{"text":"Open Sedes and then Sedes.","ruleSet":"vocabulary","matches":[{"ruleId":"app-name","count":2}]}
+```
+
+Add `--client t3-dev` to preview that configured client's effective selection.
+Without `--client`, the command uses the server default. It requires an explicit
+`--config` path, accepts at most 65,536 bytes of UTF-8 from stdin, and preserves
+sample whitespace. The command validates configuration and patterns offline;
+it does not load models, open a network listener, or require installed Python,
+ffmpeg, or token files. Errors produce a nonzero exit status and no result JSON.
+
+For Sedes Android, these corrections apply when using **Own speech server**;
+hosted OpenAI transcription bypasses this server. Each independently transcribed
+recording segment is corrected separately, so patterns cannot span segments
+that Android later joins. The corrected text becomes the transcript that Android
+saves, displays, submits, and checks for voice commands. A rule that produces
+`stop listening`, for example, can affect automatic submission; include command
+phrases in preview samples when designing rules.
+
 ## Operations
 
 For a reverse proxy, preserve bearer authentication and allow the HTTP/1.1 WebSocket upgrade for `/v1/realtime`. Disable response buffering for streamed speech. If the public API uses a path prefix, strip it before forwarding to this server's `/v1` routes and include it in the client's API base.

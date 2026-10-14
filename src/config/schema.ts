@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { MAX_RULE_SETS, MAX_RULES_PER_SET, MAX_RULE_TEXT_LENGTH, validateSubstitutionPattern } from "../transcription/substitutions.js";
 
 // Node clamps larger setTimeout delays to 1 ms; keep advertised deadlines enforceable.
 export const MAXIMUM_REALTIME_TIMEOUT_SECONDS = 2_147_483;
@@ -52,6 +53,32 @@ const SpeechModel = BaseModel.extend({
   max_text_length: z.number().int().positive().default(4096),
 });
 
+const SubstitutionName = z.string().min(1).max(64).regex(/^[a-z0-9][a-z0-9._-]*$/);
+const SubstitutionRule = z.strictObject({
+  id: SubstitutionName,
+  pattern: z.string().min(1).max(MAX_RULE_TEXT_LENGTH),
+  replacement: z.string().max(MAX_RULE_TEXT_LENGTH),
+  case_insensitive: z.boolean().default(true),
+}).superRefine((rule, context) => {
+  const error = validateSubstitutionPattern(rule.pattern, rule.case_insensitive);
+  if (error) context.addIssue({ code: "custom", path: ["pattern"], message: error });
+});
+
+const TranscriptionSubstitutions = z.strictObject({
+  default_rule_set: SubstitutionName.nullable().default(null),
+  rule_sets: z.record(SubstitutionName, z.array(SubstitutionRule).max(MAX_RULES_PER_SET)).default({}),
+}).superRefine((config, context) => {
+  if (Object.keys(config.rule_sets).length > MAX_RULE_SETS) context.addIssue({ code: "custom", path: ["rule_sets"], message: `At most ${MAX_RULE_SETS} substitution rule sets may be configured` });
+  if (config.default_rule_set !== null && !Object.hasOwn(config.rule_sets, config.default_rule_set)) context.addIssue({ code: "custom", path: ["default_rule_set"], message: "Unknown default transcription substitution rule set" });
+  for (const [name, rules] of Object.entries(config.rule_sets)) {
+    const ids = new Set<string>();
+    rules.forEach((rule, index) => {
+      if (ids.has(rule.id)) context.addIssue({ code: "custom", path: ["rule_sets", name, index, "id"], message: "Duplicate substitution rule id" });
+      ids.add(rule.id);
+    });
+  }
+});
+
 export const ConfigSchema = z.strictObject({
   server: z.strictObject({
     listen: z.string().min(3),
@@ -76,6 +103,7 @@ export const ConfigSchema = z.strictObject({
     }).default({ max_buffer_bytes: 5_760_000, max_message_bytes: 1_048_576, max_output_bytes: 1_048_576, idle_timeout_seconds: 60, max_session_seconds: 3600 }),
   }),
   auth: z.strictObject({ tokens_file: z.string().min(1) }),
+  transcription_substitutions: TranscriptionSubstitutions.default({ default_rule_set: null, rule_sets: {} }),
   models: z.array(z.discriminatedUnion("task", [TranscriptionModel, SpeechModel])).nonempty(),
   clients: z.array(z.strictObject({
     id: z.string().min(1),
@@ -83,6 +111,7 @@ export const ConfigSchema = z.strictObject({
     allowed_models: z.array(z.string()).nonempty(),
     allowed_voices: z.record(z.string(), z.array(z.string()).nonempty()).optional(),
     max_concurrent_requests: z.number().int().positive().default(2),
+    transcription_rule_set: SubstitutionName.nullable().optional(),
   })).nonempty(),
 }).superRefine((config, context) => {
   const modelIds = new Set<string>();
@@ -106,6 +135,7 @@ export const ConfigSchema = z.strictObject({
   for (const client of config.clients) {
     if (clientIds.has(client.id)) context.addIssue({ code: "custom", path: ["clients"], message: `Duplicate client id: ${client.id}` });
     clientIds.add(client.id);
+    if (client.transcription_rule_set != null && !Object.hasOwn(config.transcription_substitutions.rule_sets, client.transcription_rule_set)) context.addIssue({ code: "custom", path: ["clients", client.id, "transcription_rule_set"], message: "Unknown client transcription substitution rule set" });
     for (const id of client.allowed_models) if (!modelIds.has(id)) context.addIssue({ code: "custom", path: ["clients", client.id], message: `Unknown allowed model: ${id}` });
     for (const [id, voices] of Object.entries(client.allowed_voices ?? {})) {
       const model = config.models.find((entry) => entry.id === id);

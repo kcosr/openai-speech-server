@@ -92,7 +92,7 @@ export async function buildApp(config: Config, authenticator: Authenticator, reg
       if (model.max_duration_seconds && normalized.durationSeconds > model.max_duration_seconds) throw invalid("audio_too_long", `Audio exceeds the ${model.max_duration_seconds} second model limit.`, "file");
       const release = await modelRuntime.queue.acquire(signal);
       try {
-        const result = await registry.transcription(modelRuntime).transcribe({ path: normalized.path, ...(fields.language ? { language: fields.language } : {}), ...(fields.prompt && model.supports_prompt ? { prompt: fields.prompt } : {}), ...(extensions ? { extensions } : {}) }, signal);
+        const result = await registry.transcribe(modelRuntime, request.client, { path: normalized.path, ...(fields.language ? { language: fields.language } : {}), ...(fields.prompt && model.supports_prompt ? { prompt: fields.prompt } : {}), ...(extensions ? { extensions } : {}) }, signal);
         if (stream) return reply.type("text/event-stream; charset=utf-8").header("Cache-Control", "no-cache").send(transcriptionSse(result.text));
         return format === "text" ? reply.type("text/plain; charset=utf-8").send(result.text) : result;
       }

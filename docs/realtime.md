@@ -126,6 +126,16 @@ does not invent incremental deltas. Duration equals committed decoded PCM bytes
 divided by 48,000. Input is staged as a 24 kHz WAV and normalized to the worker's
 16 kHz mono WAV with configured ffmpeg.
 
+When [transcription substitutions](../README.md#transcription-substitutions)
+are configured, `transcript` contains the corrected final text. The authenticated
+client inherits the server's default rule set unless its server configuration
+disables substitutions or selects another set. This uses the same processing as
+HTTP transcription and adds no session settings or protocol fields. Corrections
+apply independently to each committed audio buffer, so a pattern cannot span
+commits. Duration-based usage still describes the original audio. A correction
+limit or unsupported zero-length match fails the committed item instead of
+returning partial output.
+
 One committed job may be pending per session. A second commit while it is
 pending fails with `transcription_busy` and leaves the next input buffer intact.
 Clearing that buffer does not cancel the committed job. A success or failure
