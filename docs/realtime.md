@@ -135,8 +135,10 @@ apply independently to each committed audio buffer, so a pattern cannot span
 commits. Duration-based usage still describes the original audio. A correction
 limit, processing deadline, malformed Unicode transcript, or unsupported
 zero-length match fails the committed item instead of returning partial output.
-Correction execution uses the same bounded worker and two-second call deadline
-as HTTP transcription; the deadline includes time queued for that worker.
+Correction execution uses the same bounded worker and two-second execution
+deadline as HTTP transcription, starting when dispatched to the worker. Queued
+corrections remain subject to the overall request timeout and cancellation on
+client disconnect.
 
 One committed job may be pending per session. A second commit while it is
 pending fails with `transcription_busy` and leaves the next input buffer intact.

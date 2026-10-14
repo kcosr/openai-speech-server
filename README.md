@@ -194,12 +194,15 @@ Disabled substitutions and empty rule sets leave text unchanged without these
 transcript processing limits.
 
 Correction matching runs in a separate worker to keep server requests
-responsive. A correction call has a two-second deadline, including time waiting
-for the worker; at most eight calls may wait behind the active call. A deadline
-failure returns `transcription_substitution_work_limit` and no transcript; active
-matching that exceeds its deadline also terminates the worker. A full queue returns
-`transcription_substitution_busy`. Server startup allows ten seconds for worker
-warmup. These limits also apply to the offline preview command.
+responsive. Each correction has a two-second execution deadline starting when
+it is dispatched to the worker. At most eight calls may wait behind the active
+call; queued work remains subject to the overall request timeout and cancellation
+on client disconnect. A deadline failure returns
+`transcription_substitution_work_limit` with no transcript and terminates the
+worker if matching is still running.
+A full queue returns `transcription_substitution_busy`. Worker startup has a
+separate ten-second warmup deadline. The offline preview uses the same execution
+and warmup limits.
 
 Preview a sample before restarting:
 

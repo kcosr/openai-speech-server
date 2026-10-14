@@ -20,10 +20,10 @@ type Job = {
   id: number;
   text: string;
   selection: string;
-  deadline: number;
+  deadline?: number;
   resolve: (result: SubstitutionResult) => void;
   reject: (error: unknown) => void;
-  timer: NodeJS.Timeout;
+  timer?: NodeJS.Timeout;
   signal: AbortSignal | undefined;
   abort: () => void;
 };
@@ -113,8 +113,6 @@ export class AsyncTranscriptSubstitutions {
     return new Promise<SubstitutionResult>((resolve, reject) => {
       const job: Job = {
         id: ++this.nextId, text, selection: ruleSet, resolve, reject, signal,
-        deadline: performance.now() + SUBSTITUTION_TIMEOUT_MS,
-        timer: setTimeout(() => this.cancel(job, deadlineFailure()), SUBSTITUTION_TIMEOUT_MS),
         abort: () => this.cancel(job, signal!.reason),
       };
       signal?.addEventListener("abort", job.abort, { once: true });
@@ -148,9 +146,12 @@ export class AsyncTranscriptSubstitutions {
     }
     const job = this.active;
     if (!job || message.id !== job.id) { this.workerFailed(state); return; }
-    if (performance.now() >= job.deadline) { this.cancel(job, deadlineFailure()); return; }
     this.active = undefined;
-    if (message.type === "result") {
+    if (performance.now() >= job.deadline!) {
+      // The worker has already finished. Reject the late result without killing
+      // an idle thread or delaying unrelated requests behind another warmup.
+      this.finish(job, deadlineFailure());
+    } else if (message.type === "result") {
       this.cleanup(job);
       job.resolve(message.result);
     } else {
@@ -163,13 +164,13 @@ export class AsyncTranscriptSubstitutions {
   private drain(): void {
     const state = this.state;
     if (this.stopped || !state?.ready || this.active) return;
-    let job = this.pending.shift();
-    while (job && performance.now() >= job.deadline) {
-      this.finish(job, deadlineFailure());
-      job = this.pending.shift();
-    }
+    const job = this.pending.shift();
     if (!job) { state.worker.unref(); return; }
     this.active = job;
+    // FIFO waiting does not spend another caller's execution budget. Waiting
+    // remains bounded by queue capacity, startup limits, and caller cancellation.
+    job.deadline = performance.now() + SUBSTITUTION_TIMEOUT_MS;
+    job.timer = setTimeout(() => this.cancel(job, deadlineFailure()), SUBSTITUTION_TIMEOUT_MS);
     state.worker.ref();
     state.worker.postMessage({ id: job.id, text: job.text, selection: job.selection } satisfies SubstitutionWorkerRequest);
   }

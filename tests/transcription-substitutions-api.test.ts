@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { once } from "node:events";
-import { readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { WebSocket } from "ws";
 import type { FastifyInstance } from "fastify";
@@ -43,7 +43,7 @@ describe("transcription substitutions at HTTP and Realtime boundaries", () => {
     vi.restoreAllMocks();
   });
 
-  async function boot(transcripts: string[], configure?: (config: Config) => void) {
+  async function boot(transcripts: string[], configure?: (config: Config) => void | Promise<void>) {
     const base = await testConfig(); directory = base.server.temp_directory;
     const config = ConfigSchema.parse({
       ...base,
@@ -65,7 +65,7 @@ describe("transcription substitutions at HTTP and Realtime boundaries", () => {
       ],
     });
     for (const model of config.models) model.provider_config.options.fixture_directory = directory;
-    configure?.(config);
+    await configure?.(config);
     await writeFile(config.auth.tokens_file, JSON.stringify({ tokens: Object.fromEntries(Object.entries(tokens).map(([name, token]) => [name, hashToken(token)])) }));
     await writeFile(join(directory, "fixture-config.json"), JSON.stringify({ transcripts, ttsDurationSeconds: 0.01 }));
     const registry = new Registry(config);
@@ -93,8 +93,8 @@ describe("transcription substitutions at HTTP and Realtime boundaries", () => {
     expect((await readdir(config.server.temp_directory)).filter((path) => path.endsWith(".wav"))).toEqual([]);
   }
 
-  function inferenceFinished(registry: Registry): Promise<void> {
-    const provider = registry.transcription(registry.models.get("parakeet-local")!);
+  function inferenceFinished(registry: Registry, modelId = "parakeet-local"): Promise<void> {
+    const provider = registry.transcription(registry.models.get(modelId)!);
     const original = provider.transcribe.bind(provider);
     return new Promise((resolve) => {
       vi.spyOn(provider, "transcribe").mockImplementationOnce(async (...args) => {
@@ -201,6 +201,36 @@ describe("transcription substitutions at HTTP and Realtime boundaries", () => {
     expect(failed.json().error).toMatchObject({ type: "server_error", code: "transcription_substitution_work_limit", param: null });
     await expectReleased(config, registry);
     const recovered = await transcribe("inherited"); expect(recovered.statusCode).toBe(200); expect(recovered.json().text).toBe("Sedes and Sedes.");
+  }, 10_000);
+
+  it("preserves another client's completed inference while its substitutions wait behind an expensive job", async () => {
+    const alternateModel = "alternate-transcription";
+    const { config, registry } = await boot([expensiveTranscript], async (config) => {
+      expensiveRules(config);
+      const model = structuredClone(config.models.find((entry) => entry.task === "transcription")!);
+      model.id = alternateModel; model.default = false;
+      const fixtureDirectory = join(config.server.temp_directory, "alternate-fixture");
+      await mkdir(fixtureDirectory);
+      await writeFile(join(fixtureDirectory, "fixture-config.json"), JSON.stringify({ transcripts: [rawTranscript] }));
+      model.provider_config.options.fixture_directory = fixtureDirectory;
+      config.models.push(model);
+      config.clients.find((client) => client.id === "alternate")!.allowed_models.push(alternateModel);
+    });
+    const slowInferred = inferenceFinished(registry);
+    let slowSettled = false;
+    const slow = transcribe("inherited").then((response) => { slowSettled = true; return response; });
+    await slowInferred;
+    const fastInferred = inferenceFinished(registry, alternateModel);
+    const fast = transcribe("alternate", { model: alternateModel }).then((response) => response);
+    await fastInferred;
+    expect(slowSettled).toBe(false);
+    expect(registry.models.get(alternateModel)!.provider.inFlight).toBe(0);
+    const failed = await slow;
+    expect(failed.statusCode).toBe(500); expect(failed.json().error.code).toBe("transcription_substitution_work_limit");
+    const corrected = await fast;
+    expect(corrected.statusCode).toBe(200); expect(corrected.json()).toEqual({ text: "Sedes Mobile and Sedes Mobile.", language: "en" });
+    expect(registry.models.get(alternateModel)!.queue.occupancy).toBe(0);
+    await expectReleased(config, registry);
   }, 10_000);
 
   it("correlates a Realtime substitution deadline and recovers the next utterance", async () => {

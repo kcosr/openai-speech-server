@@ -67,17 +67,32 @@ describe("isolated transcription substitutions", () => {
     } finally { await engine.stop(); }
   });
 
-  it("includes queue waiting in each deadline and does not retry timed-out work", async () => {
+  it("preserves a cheap queued call when another rule set exceeds its execution deadline", async () => {
     const engine = create();
     try {
       await engine.start();
       const active = engine.apply(slowText, "slow").catch(error => error);
-      const queued = engine.apply("seedus").catch(error => error);
+      await delay(5);
+      const queued = engine.apply("seedus");
       expect(await active).toMatchObject({ code: "transcription_substitution_work_limit" });
-      expect(await queued).toMatchObject({ code: "transcription_substitution_work_limit" });
+      expect((await queued).text).toBe("Sedes");
       expect((await engine.apply("seedus")).text).toBe("Sedes");
     } finally { await engine.stop(); }
   }, 10_000);
+
+  it("gives concurrent phrase-matching calls their own execution budgets", async () => {
+    const rules = Array.from({ length: 100 }, (_, index) => rule(`\\b(?:\\p{L}+\\s+){0,8}zz${index}\\b`, `translated-${index}`, `phrase-${index}`));
+    const engine = new AsyncTranscriptSubstitutions({ default_rule_set: "common", rule_sets: { common: rules } });
+    const text = "ordinary words ".repeat(273) + "zz42";
+    try {
+      await engine.start();
+      const results = await Promise.all(Array.from({ length: 5 }, () => engine.apply(text)));
+      for (const result of results) {
+        expect(result.text).toBe("ordinary words ".repeat(269) + "translated-42");
+        expect(result.matches).toEqual([{ ruleId: "phrase-42", count: 1 }]);
+      }
+    } finally { await engine.stop(); }
+  }, 15_000);
 
   it("stops active and queued jobs and cannot restart after shutdown", async () => {
     const engine = create();
