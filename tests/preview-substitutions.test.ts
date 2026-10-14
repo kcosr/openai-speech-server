@@ -35,7 +35,7 @@ describe("offline substitution preview", () => {
 
   function preview(input: string | Buffer, args: string[] = []) {
     return spawnSync(process.execPath, ["--import", "tsx", resolve("scripts/preview-substitutions.ts"), "--config", configPath, ...args], {
-      input, encoding: "utf8", timeout: 10_000, maxBuffer: 1_048_576,
+      input, encoding: "utf8", timeout: 15_000, maxBuffer: 1_048_576,
     });
   }
 
@@ -117,4 +117,23 @@ describe("offline substitution preview", () => {
     expect(result.stdout).toBe("");
     expect(result.stderr).toContain("Usage:");
   });
+
+  it("bounds expensive matching and closes its worker before exiting", async () => {
+    await writeFile(configPath, YAML.stringify({
+      ...configuration,
+      transcription_substitutions: {
+        default_rule_set: "common",
+        rule_sets: {
+          ...configuration.transcription_substitutions.rule_sets,
+          common: Array.from({ length: 10 }, (_, index) => ({ id: `slow-${index}`, pattern: `[^Q]{0,1000}Q${index}`, replacement: "corrected" })),
+        },
+      },
+    }));
+    const result = preview("a".repeat(65_536));
+    expect(result.error).toBeUndefined();
+    expect(result.signal).toBeNull();
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("transcription_substitution_work_limit");
+  }, 20_000);
 });

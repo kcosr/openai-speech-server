@@ -3,7 +3,8 @@ import { parseArgs } from "node:util";
 import YAML from "yaml";
 import { ApiError } from "../src/api/errors.js";
 import { ConfigSchema } from "../src/config/schema.js";
-import { MAX_TRANSCRIPT_BYTES, TranscriptSubstitutions } from "../src/transcription/substitutions.js";
+import { MAX_TRANSCRIPT_BYTES } from "../src/transcription/substitutions.js";
+import { AsyncTranscriptSubstitutions } from "../src/transcription/runner.js";
 
 const usage = "Usage: npm run preview:substitutions -- --config <config.yaml> [--client <client-id>] < transcript.txt";
 
@@ -49,10 +50,15 @@ async function main(): Promise<void> {
   const config = parsed.data;
   const client = values.client === undefined ? undefined : config.clients.find(entry => entry.id === values.client);
   if (values.client !== undefined && !client) throw new PreviewError("Unknown configured client ID.");
-  const substitutions = new TranscriptSubstitutions(config.transcription_substitutions);
   const transcript = await readTranscript();
-  const result = substitutions.apply(transcript, client?.transcription_rule_set);
-  process.stdout.write(`${JSON.stringify(result)}\n`);
+  const substitutions = new AsyncTranscriptSubstitutions(config.transcription_substitutions);
+  try {
+    await substitutions.start();
+    const result = await substitutions.apply(transcript, client?.transcription_rule_set);
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+  } finally {
+    await substitutions.stop();
+  }
 }
 
 main().catch(error => {

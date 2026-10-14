@@ -68,8 +68,11 @@ describe("transcription substitutions at HTTP and Realtime boundaries", () => {
     configure?.(config);
     await writeFile(config.auth.tokens_file, JSON.stringify({ tokens: Object.fromEntries(Object.entries(tokens).map(([name, token]) => [name, hashToken(token)])) }));
     await writeFile(join(directory, "fixture-config.json"), JSON.stringify({ transcripts, ttsDurationSeconds: 0.01 }));
-    const registry = new Registry(config); await registry.start();
-    app = await buildApp(config, await Authenticator.create(config), registry); app.log.level = "silent";
+    const registry = new Registry(config);
+    try {
+      await registry.start();
+      app = await buildApp(config, await Authenticator.create(config), registry); app.log.level = "silent";
+    } catch (error) { await registry.stop(); throw error; }
     const url = await app.listen({ host: "127.0.0.1", port: 0 });
     async function connect(client: keyof typeof tokens = "inherited") {
       const peer = new Peer(new WebSocket(`${url.replace("http:", "ws:")}/v1/realtime?intent=transcription`, { headers: { authorization: `Bearer ${tokens[client]}` } })); peers.push(peer);
@@ -88,6 +91,26 @@ describe("transcription substitutions at HTTP and Realtime boundaries", () => {
     const runtime = registry.models.get("parakeet-local")!;
     expect(runtime.queue.occupancy).toBe(0); expect(runtime.provider.inFlight).toBe(0);
     expect((await readdir(config.server.temp_directory)).filter((path) => path.endsWith(".wav"))).toEqual([]);
+  }
+
+  function inferenceFinished(registry: Registry): Promise<void> {
+    const provider = registry.transcription(registry.models.get("parakeet-local")!);
+    const original = provider.transcribe.bind(provider);
+    return new Promise((resolve) => {
+      vi.spyOn(provider, "transcribe").mockImplementationOnce(async (...args) => {
+        const result = await original(...args); resolve(); return result;
+      });
+    });
+  }
+
+  const expensiveTranscript = "a".repeat(65_536);
+  function expensiveRules(config: Config) {
+    config.transcription_substitutions.rule_sets.shared = [
+      ...Array.from({ length: 10 }, (_, index) => ({ id: `expensive-${index}`, pattern: `[^Q]{0,1000}Q${index}`, replacement: "x", case_insensitive: true })),
+      { id: "product-name", pattern: "\\b(?:seedus|seedes)\\b", replacement: "Sedes", case_insensitive: true },
+    ];
+    for (const client of config.clients) client.max_concurrent_requests = 1;
+    expect(ConfigSchema.safeParse(config).success).toBe(true);
   }
 
   it("applies inherited, disabled, and alternate rules identically to JSON, text, and final SSE without changing TTS", async () => {
@@ -161,4 +184,48 @@ describe("transcription substitutions at HTTP and Realtime boundaries", () => {
     const next = await connect(); next.commit(); expect((await next.next("conversation.item.input_audio_transcription.completed")).transcript).toBe("next session");
     await expectReleased(config, registry);
   });
+
+  it("keeps HTTP responsive during expensive substitutions, returns the deadline error, and recovers", async () => {
+    const { config, registry } = await boot([expensiveTranscript, rawTranscript], expensiveRules);
+    const inferred = inferenceFinished(registry);
+    let settled = false;
+    const pending = transcribe("inherited", { stream: "true" }).then((response) => { settled = true; return response; });
+    await inferred;
+    const healthStarted = performance.now();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const health = await app!.inject({ url: "/health/live" });
+    expect(health.statusCode).toBe(200); expect(performance.now() - healthStarted).toBeLessThan(1000);
+    expect(settled).toBe(false);
+    const failed = await pending;
+    expect(failed.statusCode).toBe(500); expect(failed.headers["content-type"]).toBe("application/json; charset=utf-8");
+    expect(failed.json().error).toMatchObject({ type: "server_error", code: "transcription_substitution_work_limit", param: null });
+    await expectReleased(config, registry);
+    const recovered = await transcribe("inherited"); expect(recovered.statusCode).toBe(200); expect(recovered.json().text).toBe("Sedes and Sedes.");
+  }, 10_000);
+
+  it("correlates a Realtime substitution deadline and recovers the next utterance", async () => {
+    const { config, registry, connect } = await boot([expensiveTranscript, rawTranscript], expensiveRules);
+    const peer = await connect(); peer.commit(); const committed = await peer.next("input_audio_buffer.committed");
+    const failed = await peer.next("conversation.item.input_audio_transcription.failed");
+    expect(failed).toMatchObject({ item_id: committed.item_id, content_index: 0, error: { type: "transcription_error", code: "transcription_substitution_work_limit", param: null } });
+    expect(peer.events.some((event) => event.type.endsWith(".completed"))).toBe(false);
+    await expectReleased(config, registry);
+    peer.commit(); expect((await peer.next("conversation.item.input_audio_transcription.completed")).transcript).toBe("Sedes and Sedes.");
+    await expectReleased(config, registry);
+  }, 10_000);
+
+  it("cancels substitutions on Realtime disconnect and releases admission for the next session", async () => {
+    const { config, registry, connect } = await boot([expensiveTranscript, rawTranscript], expensiveRules);
+    const inferred = inferenceFinished(registry);
+    const peer = await connect(); peer.commit(); await inferred;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const runtime = registry.models.get("parakeet-local")!;
+    expect(runtime.queue.occupancy).toBe(1); expect(runtime.provider.inFlight).toBe(0);
+    peer.socket.close(); await once(peer.socket, "close");
+    await expect.poll(() => runtime.queue.occupancy, { timeout: 1500 }).toBe(0);
+    await expectReleased(config, registry);
+    const next = await connect(); next.commit();
+    expect((await next.next("conversation.item.input_audio_transcription.completed")).transcript).toBe("Sedes and Sedes.");
+    expect(peer.events.some((event) => event.type.endsWith(".completed") || event.type.endsWith(".failed"))).toBe(false);
+  }, 10_000);
 });

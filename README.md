@@ -193,6 +193,14 @@ also contain well-formed Unicode.
 Disabled substitutions and empty rule sets leave text unchanged without these
 transcript processing limits.
 
+Correction matching runs in a separate worker to keep server requests
+responsive. A correction call has a two-second deadline, including time waiting
+for the worker; at most eight calls may wait behind the active call. A deadline
+failure returns `transcription_substitution_work_limit` and no transcript; active
+matching that exceeds its deadline also terminates the worker. A full queue returns
+`transcription_substitution_busy`. Server startup allows ten seconds for worker
+warmup. These limits also apply to the offline preview command.
+
 Preview a sample before restarting:
 
 ```bash
@@ -208,7 +216,8 @@ Add `--client t3-dev` to preview that configured client's effective selection.
 Without `--client`, the command uses the server default. It requires an explicit
 `--config` path, accepts at most 65,536 bytes of UTF-8 from stdin, and preserves
 sample whitespace. The result is one compact JSON line, including escaped sample
-newlines. The command validates configuration and patterns offline;
+newlines. The command validates configuration and patterns offline, runs the
+same bounded correction worker, and closes it before exiting;
 it does not load models, open a network listener, or require installed Python,
 ffmpeg, or token files. Errors produce a nonzero exit status and no result JSON.
 
