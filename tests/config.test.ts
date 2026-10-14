@@ -27,3 +27,75 @@ describe("configuration", () => {
   it("fails fast when an enabled model executable is missing", async () => { const directory = await mkdtemp(join(tmpdir(), "speech-config-")); const path = join(directory, "config.yaml"); try { await writeFile(path, YAML.stringify({ ...base, server: { listen: "127.0.0.1:1", ffmpeg: "/usr/bin/true", prlimit: "/usr/bin/true" }, models: [{ ...base.models[0], provider_config: { python: "/definitely/missing/python" } }] })); await expect(loadConfig(path)).rejects.toThrow(/Python executable.*missing or not executable/); } finally { await rm(directory, { recursive: true, force: true }); } });
   it("fails fast when a custom worker command is missing", async () => { const directory = await mkdtemp(join(tmpdir(), "speech-config-")); const path = join(directory, "config.yaml"); try { await writeFile(path, YAML.stringify({ ...base, server: { listen: "127.0.0.1:1", ffmpeg: "/usr/bin/true", prlimit: "/usr/bin/true" }, models: [{ ...base.models[0], provider: "custom", provider_config: { python: process.execPath, command: "/definitely/missing/worker.py" } }] })); await expect(loadConfig(path)).rejects.toThrow(/Worker command.*missing or not readable/); } finally { await rm(directory, { recursive: true, force: true }); } });
 });
+
+describe("transcription substitution configuration", () => {
+  const rule = { id: "name", pattern: "\\b(?:seedus|sedus)\\b", replacement: "Sedes" };
+  const substitutions = { default_rule_set: "common", rule_sets: { common: [rule] } };
+  const parse = (value: unknown = substitutions, clients: unknown = base.clients) => ConfigSchema.parse({ ...base, transcription_substitutions: value, clients });
+
+  it("defaults to disabled and leaves client inheritance distinct from null", () => {
+    expect(ConfigSchema.parse(base).transcription_substitutions).toEqual({ default_rule_set: null, rule_sets: {} });
+    expect(parse({}).transcription_substitutions).toEqual({ default_rule_set: null, rule_sets: {} });
+    const config = parse(substitutions, [{ ...base.clients[0]!, transcription_rule_set: null }]);
+    expect(config.clients[0]!.transcription_rule_set).toBeNull();
+    expect(parse().clients[0]!.transcription_rule_set).toBeUndefined();
+    expect(parse().transcription_substitutions.rule_sets.common?.[0]?.case_insensitive).toBe(true);
+  });
+
+  it("accepts a named client override and an empty replacement", () => {
+    const config = parse({ ...substitutions, rule_sets: { common: [{ ...rule, replacement: "" }] } }, [{ ...base.clients[0]!, transcription_rule_set: "common" }]);
+    expect(config.clients[0]!.transcription_rule_set).toBe("common");
+    expect(config.transcription_substitutions.rule_sets.common?.[0]?.replacement).toBe("");
+  });
+
+  it.each(["missing", "constructor", "tostring"])("rejects unknown default and client rule sets: %s", name => {
+    expect(() => parse({ ...substitutions, default_rule_set: name })).toThrow(/Unknown default/);
+    expect(() => parse(substitutions, [{ ...base.clients[0]!, transcription_rule_set: name }])).toThrow(/Unknown client/);
+  });
+
+  it("rejects duplicate rule IDs but allows reuse across sets", () => {
+    expect(() => parse({ ...substitutions, rule_sets: { common: [rule, rule] } })).toThrow(/Duplicate substitution rule/);
+    expect(() => parse({ ...substitutions, rule_sets: { common: [rule], other: [rule] } })).not.toThrow();
+  });
+
+  it.each(["(", "a(?=b)", "(?<=a)b", "(a)\\1", "\\C", String.raw`\c\Q|\C`, String.raw`\u0061`])("rejects invalid or unsupported expressions in unused rule sets: %s", pattern => {
+    expect(() => parse({ rule_sets: { unused: [{ ...rule, pattern }] } })).toThrow(/RE2/);
+  });
+
+  it("accepts literal backslash-C and RE2 quoted text", () => {
+    for (const pattern of [String.raw`\\C`, String.raw`\Q\C\E`]) expect(() => parse({ rule_sets: { common: [{ ...rule, pattern }] } })).not.toThrow();
+  });
+
+  it.each(["", "^", "$", "\\b", "\\B", "a*", "(?:seedus)?", "seedus|"])("rejects empty-match expressions at startup: %s", pattern => {
+    expect(() => parse({ rule_sets: { common: [{ ...rule, pattern }] } })).toThrow();
+  });
+
+  it("bounds rule sets, rules, names, patterns, and replacements", () => {
+    expect(() => parse({ rule_sets: Object.fromEntries(Array.from({ length: 33 }, (_, index) => [`set-${index}`, []])) })).toThrow(/At most 32/);
+    expect(() => parse({ rule_sets: { common: Array.from({ length: 101 }, (_, index) => ({ ...rule, id: `rule-${index}` })) } })).toThrow();
+    for (const field of ["pattern", "replacement"] as const) expect(() => parse({ rule_sets: { common: [{ ...rule, [field]: "a".repeat(1025) }] } })).toThrow();
+    expect(() => parse({ rule_sets: { ["a".repeat(65)]: [] } })).toThrow();
+    expect(() => parse({ rule_sets: { common: [{ ...rule, id: "a".repeat(65) }] } })).toThrow();
+  });
+
+  it("rejects malformed Unicode patterns and replacement text", () => {
+    for (const field of ["pattern", "replacement"]) {
+      expect(() => parse({ rule_sets: { common: [{ ...rule, [field]: "\ud800" }] } })).toThrow(/well-formed Unicode/);
+      expect(() => parse({ rule_sets: { common: [{ ...rule, [field]: "\udc00" }] } })).toThrow(/well-formed Unicode/);
+    }
+  });
+
+  it("bounds compiled programs per expression and across every rule set", () => {
+    expect(() => parse({ rule_sets: { common: [{ ...rule, pattern: "(?:abcde){1000}" }] } })).toThrow(/4096-instruction/);
+    const maximumProgramRule = { ...rule, pattern: "(?:abcd){1000}q{94}" };
+    expect(() => parse({ rule_sets: { common: [maximumProgramRule] } })).not.toThrow();
+    const rule_sets = { common: Array.from({ length: 65 }, (_, index) => ({ ...maximumProgramRule, id: `rule-${index}` })) };
+    expect(() => parse({ rule_sets })).toThrow(/262144-instruction total/);
+  }, 15_000);
+
+  it("rejects alias fields and unknown options", () => {
+    expect(() => parse({ default: "common", rule_sets: {} })).toThrow();
+    expect(() => parse({ rule_sets: { common: [{ ...rule, flags: "i" }] } })).toThrow();
+    expect(() => ConfigSchema.parse({ ...base, clients: [{ ...base.clients[0], substitution_rules: [] }] })).toThrow();
+  });
+});

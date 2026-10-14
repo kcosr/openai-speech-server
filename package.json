@@ -14,6 +14,7 @@
     "test:coverage": "vitest run tests --coverage",
     "check": "npm run check:version && tsc -p tsconfig.json --noEmit && vitest run tests",
     "smoke": "tsx scripts/smoke.ts",
+    "preview:substitutions": "tsx scripts/preview-substitutions.ts",
     "check:version": "node scripts/version.mjs check",
     "version:set": "node scripts/version.mjs set",
     "release:prepare": "node scripts/release.mjs prepare",
@@ -27,6 +28,7 @@
     "ajv-formats": "^3.0.1",
     "fastify": "^5.6.2",
     "prom-client": "^15.1.3",
+    "re2js": "2.8.6",
     "ws": "^8.22.0",
     "yaml": "^2.8.1",
     "zod": "^4.1.12"

@@ -183,7 +183,7 @@ class RealtimeSession {
       const maxOutputBytes = Math.ceil(pcm.length / 2 * 16000 / 24000) * 2 + 4096;
       const normalized = await normalizeUpload(upload, { ffmpeg: this.config.server.ffmpeg, prlimit: this.config.server.prlimit, memoryBytes: this.config.server.ffmpeg_memory_bytes, timeoutMs: this.config.server.normalization_timeout_seconds * 1000, maxOutputBytes }, signal);
       phase = "inference";
-      const result = await this.registry.transcription(settings.runtime).transcribe({ path: normalized.path, ...(settings.language ? { language: settings.language } : {}), ...(settings.prompt !== undefined ? { prompt: settings.prompt } : {}) }, signal);
+      const result = await this.registry.transcribe(settings.runtime, this.client, { path: normalized.path, ...(settings.language ? { language: settings.language } : {}), ...(settings.prompt !== undefined ? { prompt: settings.prompt } : {}) }, signal);
       signal.throwIfAborted();
       return { type: "conversation.item.input_audio_transcription.completed", item_id: itemId, content_index: 0, transcript: result.text, usage: { type: "duration", seconds: pcm.length / REALTIME_BYTES_PER_SECOND } };
     } catch (error) {

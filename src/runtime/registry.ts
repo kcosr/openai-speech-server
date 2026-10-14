@@ -1,6 +1,6 @@
 import type { Config, ModelConfig, SpeechModelConfig, TranscriptionModelConfig } from "../config/schema.js";
 import type { Client } from "../auth/auth.js";
-import type { Provider, SpeechProvider, TranscriptionProvider } from "../providers/types.js";
+import type { Provider, SpeechProvider, TranscriptRequest, TranscriptResult, TranscriptionProvider } from "../providers/types.js";
 import { PythonSpeechProvider, PythonTranscriptionProvider } from "../providers/python.js";
 import { WorkerSupervisor } from "../providers/supervisor.js";
 import { ModelQueue } from "./admission.js";
@@ -8,12 +8,15 @@ import { invalid } from "../api/errors.js";
 import { ExtensionValidator } from "../extensions/validator.js";
 import { resolveWorkerCommand } from "../providers/command.js";
 import { realtimeCapability } from "./realtime-limits.js";
+import { AsyncTranscriptSubstitutions } from "../transcription/runner.js";
 
 export type ModelRuntime = { config: ModelConfig; provider: Provider; queue: ModelQueue; extensions: ExtensionValidator };
 
 export class Registry {
   readonly models = new Map<string, ModelRuntime>();
+  private readonly substitutions: AsyncTranscriptSubstitutions;
   constructor(private readonly config: Config) {
+    this.substitutions = new AsyncTranscriptSubstitutions(config.transcription_substitutions);
     for (const model of config.models) {
       const extensions = new ExtensionValidator(model.id, model.extensions);
       if (!model.enabled) continue;
@@ -25,8 +28,8 @@ export class Registry {
       this.models.set(model.id, { config: model, provider, queue: new ModelQueue(model.provider_config.workers, config.server.queue_max_depth, config.server.queue_wait_timeout_seconds * 1000), extensions });
     }
   }
-  async start() { await Promise.all([...this.models.values()].map(({ provider }) => provider.start())); }
-  async stop() { await Promise.allSettled([...this.models.values()].map(({ provider }) => provider.stop())); }
+  async start() { await Promise.all([this.substitutions.start(), ...[...this.models.values()].map(({ provider }) => provider.start())]); }
+  async stop() { await Promise.allSettled([this.substitutions.stop(), ...[...this.models.values()].map(({ provider }) => provider.stop())]); }
   resolve(id: string, task: ModelConfig["task"], client: Client): ModelRuntime {
     const resolvedId = id === "default" ? this.defaultModelId(task, client) : id;
     const runtime = this.models.get(resolvedId);
@@ -34,6 +37,13 @@ export class Registry {
     return runtime;
   }
   transcription(runtime: ModelRuntime) { return runtime.provider as TranscriptionProvider; }
+  async transcribe(runtime: ModelRuntime, client: Client, request: TranscriptRequest, signal: AbortSignal): Promise<TranscriptResult> {
+    const result = await this.transcription(runtime).transcribe(request, signal);
+    signal.throwIfAborted();
+    const corrected = await this.substitutions.apply(result.text, client.transcription_rule_set, signal);
+    signal.throwIfAborted();
+    return { ...result, text: corrected.text };
+  }
   speech(runtime: ModelRuntime) { return runtime.provider as SpeechProvider; }
   resolveVoice(model: SpeechModelConfig, client: Client, requested: string | undefined): string {
     const allowed = allowedSpeechVoices(model, client);

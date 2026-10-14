@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Configurable regex transcription corrections with a shared default, optional client exceptions, and an offline preview command. ([#4](https://github.com/kcosr/openai-speech-server/pull/4))
+
 ## [0.1.1] - 2026-10-11
 
 ### Added
