@@ -4,7 +4,7 @@
 
 ### Added
 
-- Configurable pronunciation mappings for speech synthesis, with independent client overrides and offline previews.
+- Configurable pronunciation mappings for speech synthesis, with independent client overrides and offline previews. ([#6](https://github.com/kcosr/openai-speech-server/pull/6))
 
 ## [0.1.2] - 2026-10-14
 
