@@ -36,6 +36,19 @@ transcription_substitutions:
         replacement: 'Sedes'
         case_insensitive: true
 
+# Optional pronunciation adjustments; restart after changing them.
+# Set default_rule_set to pronunciation to enable these rules for ALL clients.
+# These rules change only synthesis input, leaving clients' displayed text intact.
+# Audition replacements with your chosen voice; pronunciation is engine-dependent.
+speech_substitutions:
+  default_rule_set: null
+  rule_sets:
+    pronunciation:
+      - id: merge-request
+        pattern: '\bMR\b'
+        replacement: 'M. R.'
+        case_insensitive: false
+
 models:
   - id: parakeet-local
     display_label: Parakeet TDT CTC 110M
@@ -85,5 +98,7 @@ clients:
     token_ref: t3-dev
     allowed_models: [parakeet-local, kokoro-local]
     max_concurrent_requests: 2
-    # Optional exceptions: null disables corrections; a set name replaces the default.
+    # Optional independent exceptions: null disables that direction;
+    # a set name replaces that direction's default. Omit to inherit the default.
     # transcription_rule_set: null
+    # speech_rule_set: null

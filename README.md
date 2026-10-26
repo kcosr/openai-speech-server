@@ -122,12 +122,22 @@ The `server.realtime` defaults bound a buffer to 5,760,000 decoded bytes (120 se
 
 Every authorized transcription entry in `GET /v1/audio/capabilities` includes a required `realtime` object with `max_buffer_bytes`, `max_message_bytes`, `max_output_bytes`, `idle_timeout_seconds`, and `max_session_seconds`. These are effective limits derived from the existing configuration, not additional settings. The buffer is the smaller of the server buffer and the model's `max_duration_seconds` at 48,000 PCM bytes per second, rounded down to a whole two-byte sample. Clients should discover the selected model's limits before recording and reject configurations they cannot support. The session lifetime starts after the WebSocket upgrade; a client can conservatively budget it from immediately before opening the connection, without comparing wall clocks. See [resource limits](docs/realtime.md#resource-limits) for the complete capability contract.
 
-## Transcription substitutions
+## Text substitutions
 
-Configure recurring recognition corrections once in the server's YAML. The
-default rule set applies automatically to every client, including newly added
-clients. Omit `transcription_substitutions` to leave transcripts unchanged.
-For example, this maps three variations to one phrase:
+Configure recognition corrections and pronunciation adjustments in separate
+YAML dictionaries using the same rule syntax and selection behavior:
+
+| Direction | Dictionary | Optional client selection |
+| --- | --- | --- |
+| Recognized speech → returned text | `transcription_substitutions` | `transcription_rule_set` |
+| Submitted text → synthesis input | `speech_substitutions` | `speech_rule_set` |
+
+Both directions are disabled by default. A dictionary's default rule set applies
+automatically to every client, including newly added clients. Omit either
+dictionary to leave that direction unchanged. Configuration is validated at
+startup; restart the server after changing rules or client selections.
+
+For recognition corrections, this maps three variations to one phrase:
 
 ```yaml
 transcription_substitutions:
@@ -140,23 +150,50 @@ transcription_substitutions:
         case_insensitive: true
 ```
 
-Rules apply after model inference and before the final response, consistently
-across HTTP JSON, text, SSE, and Realtime transcription. They do not change
-speech synthesis. Configuration is validated at startup; restart the server
-after changing rules or client selections.
+Transcription rules apply after model inference and before the final response,
+consistently across HTTP JSON, text, SSE, and Realtime transcription.
+
+For pronunciation adjustments, this illustrative rule changes uppercase
+`MR` to `M. R.` before synthesis without matching `Mr.` or `MRI`:
+
+```yaml
+speech_substitutions:
+  default_rule_set: pronunciation
+  rule_sets:
+    pronunciation:
+      - id: merge-request
+        pattern: '\bMR\b'
+        replacement: 'M. R.'
+        case_insensitive: false
+```
+
+Speech rules apply to `POST /v1/audio/speech` before input is sent to the model.
+Clients keep the original text for display and storage; only synthesis input
+changes. The two dictionaries are independent. Every adjustment comes from a
+configured rule; the server has no built-in vocabulary or automatic punctuation
+rewrites. Try replacement words, spellings, or punctuation with your chosen
+voice: a preview shows the mapping, while actual pronunciation needs listening.
+Both original and mapped speech input must fit the selected model's
+`max_text_length`. A mapping that leaves only whitespace or empty text fails
+before synthesis starts.
+When a nonempty speech set is active, submitted text is also limited to 65,536
+UTF-8 bytes, even if the model allows more characters. Exceeding either input
+limit returns `400 input_too_long`; expansion beyond an output limit returns
+`500 speech_substitution_output_limit` before audio starts.
+Malformed Unicode input to an active speech set returns `400 invalid_input`.
 
 No client setting is needed for the default. For exceptions, set a field on an
 existing entry in `clients`:
 
-| `transcription_rule_set` | Effect |
+| `transcription_rule_set` / `speech_rule_set` | Effect in that direction |
 | --- | --- |
-| Omitted | Use `transcription_substitutions.default_rule_set` |
+| Omitted | Use the corresponding dictionary's `default_rule_set` |
 | `null` | Disable substitutions for this client |
 | A rule set name, such as `technical` | Use that set in place of the default |
 
 The global `default_rule_set` may also be `null` (its default), enabling only
 clients that explicitly select a set. Selection belongs to the authenticated
-client identity; devices sharing that identity receive the same corrections.
+client identity; devices sharing that identity receive the same rules.
 Clients cannot select or edit rule sets through audio API requests.
 
 Patterns use [RE2 syntax](https://github.com/google/re2/wiki/Syntax)
@@ -170,38 +207,40 @@ preserve regex backslashes. Matching is case insensitive by default; set
 `case_insensitive: false` for an exact-case rule.
 
 Each rule's `replacement` is literal text: `$1` and backslashes do not expand
-captures. All matching uses the original transcript, so replacement text does
-not trigger another correction. Nonoverlapping matches are replaced throughout
-the transcript. The earliest match wins an overlap; when matches start at the
+captures. All matching uses the original text, so replacement text does
+not trigger another substitution. Nonoverlapping matches are replaced throughout
+the text. The earliest match wins an overlap; when matches start at the
 same position, the earlier rule in the configured list wins. Rule IDs must be
 unique within a set. Zero-length matches are unsupported: detected expressions
 are rejected during startup, and any encountered at runtime fail the
-transcription without returning a partially corrected result.
+request without returning a partially substituted result or starting synthesis.
 
-Configuration allows 32 sets with up to 100 rules each. Set names and rule IDs
+Each direction allows 32 sets with up to 100 rules each. Set names and rule IDs
 use lowercase letters, digits, dots, underscores, or hyphens, start with a letter
 or digit, and are at most 64 characters. Patterns and replacements are each
 limited to 1,024 UTF-16 code units. Compiled regex programs are limited to 4,096
-instructions per rule and 262,144 instructions across all configured sets;
+instructions per rule and 262,144 instructions across all sets in that direction;
 oversized expressions or dictionaries are rejected at startup. When a nonempty
-set is active, input and corrected output are each limited to 65,536 UTF-8 bytes;
+set is active, input and substituted output are each limited to 65,536 UTF-8 bytes;
 matching is also bounded to 4,096 candidate matches, including discarded
 overlapping candidates.
-Exceeding a limit or receiving a malformed Unicode transcript fails the
-transcription without returning partial output. Patterns and replacements must
-also contain well-formed Unicode.
+Exceeding a limit or receiving malformed Unicode text fails the
+request without returning partial output or starting synthesis. Patterns and
+replacements must also contain well-formed Unicode.
 Disabled substitutions and empty rule sets leave text unchanged without these
-transcript processing limits.
+matcher processing limits. The model's speech input limit still applies.
 
-Correction matching runs in a separate worker to keep server requests
-responsive. Each correction has a two-second execution deadline starting when
+Matching runs in a separate worker for each direction to keep server requests
+responsive. Each substitution has a two-second execution deadline starting when
 it is dispatched to the worker. At most eight calls may wait behind the active
 call; queued work remains subject to the overall request timeout and cancellation
 on client disconnect. A deadline failure returns
-`transcription_substitution_work_limit` with no transcript and terminates the
-worker if matching is still running.
-A full queue returns `transcription_substitution_busy`. Worker startup has a
-separate ten-second warmup deadline. The offline preview uses the same execution
+`transcription_substitution_work_limit` or `speech_substitution_work_limit`
+without returning text or audio and terminates the worker if matching is still
+running.
+A full queue returns `transcription_substitution_busy` or
+`speech_substitution_busy`. Worker startup has a separate ten-second warmup
+deadline. The offline preview uses the same execution
 and warmup limits.
 
 Preview a sample before restarting:
@@ -216,13 +255,29 @@ printf '%s' 'Open seedus and then seedes.' | env -u NODE_ENV npm run --silent pr
 ```
 
 Add `--client t3-dev` to preview that configured client's effective selection.
-Without `--client`, the command uses the server default. It requires an explicit
-`--config` path, accepts at most 65,536 bytes of UTF-8 from stdin, and preserves
+The default task is `transcription`; select `--task speech` for pronunciation
+rules (or `--task transcription` explicitly for recognition rules):
+
+```bash
+printf '%s' 'Review MR 42.' | env -u NODE_ENV npm run --silent preview:substitutions -- \
+  --config "$HOME/.config/openai-speech-server/config.yaml" --task speech
+```
+
+```json
+{"text":"Review M. R. 42.","ruleSet":"pronunciation","matches":[{"ruleId":"merge-request","count":1}]}
+```
+
+Without `--client`, the command uses the selected direction's server default.
+It requires an explicit `--config` path, accepts at most 65,536 bytes of UTF-8 from
+stdin, and preserves
 sample whitespace. The result is one compact JSON line, including escaped sample
 newlines. The command validates configuration and patterns offline, runs the
-same bounded correction worker, and closes it before exiting;
+same bounded substitution worker, and closes it before exiting;
 it does not load models, open a network listener, or require installed Python,
-ffmpeg, or token files. Errors produce a nonzero exit status and no result JSON.
+ffmpeg, or token files. Speech previews reject mappings that leave only
+whitespace or empty text, like the speech endpoint. The preview does not validate
+model-specific speech text limits or generate audio. Errors produce a nonzero
+exit status and no result JSON.
 
 For Sedes Android, these corrections apply when using **Own speech server**;
 hosted OpenAI transcription bypasses this server. Each independently transcribed

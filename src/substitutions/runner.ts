@@ -1,7 +1,6 @@
 import { Worker } from "node:worker_threads";
 import { ApiError } from "../api/errors.js";
-import type { Config } from "../config/schema.js";
-import { MAX_TRANSCRIPT_BYTES, isWellFormedUnicode, type SubstitutionResult } from "./substitutions.js";
+import { MAX_TEXT_BYTES, isWellFormedUnicode, substitutionFailure, type SubstitutionConfig, type SubstitutionResult, type SubstitutionTask } from "./substitutions.js";
 
 export const SUBSTITUTION_TIMEOUT_MS = 2000;
 export const SUBSTITUTION_STARTUP_TIMEOUT_MS = 10_000;
@@ -36,15 +35,9 @@ type WorkerState = {
   timer: NodeJS.Timeout;
 };
 
-function failure(code: string, message: string, status = 500): ApiError {
-  return new ApiError(status, "server_error", `transcription_substitution_${code}`, message);
-}
-
-const deadlineFailure = () => failure("work_limit", "The transcript exceeds the substitution processing deadline");
-
-/** Runs correction away from the HTTP event loop, with enforceable deadlines. */
-export class AsyncTranscriptSubstitutions {
-  private readonly config: Config["transcription_substitutions"];
+/** Runs substitutions away from the HTTP event loop, with enforceable deadlines. */
+export class AsyncTextSubstitutions {
+  private readonly config: SubstitutionConfig;
   private readonly pending: Job[] = [];
   private state: WorkerState | undefined;
   private active: Job | undefined;
@@ -52,19 +45,25 @@ export class AsyncTranscriptSubstitutions {
   private stopped = false;
   private nextId = 0;
 
-  constructor(config: Config["transcription_substitutions"]) {
+  constructor(config: SubstitutionConfig, private readonly task: SubstitutionTask) {
     this.config = structuredClone(config);
   }
 
+  private get inputLabel(): string { return this.task === "transcription" ? "transcript" : "speech text"; }
+
+  private deadlineFailure(): ApiError {
+    return substitutionFailure(this.task, "work_limit", `The ${this.inputLabel} exceeds the substitution processing deadline`);
+  }
+
   async start(): Promise<void> {
-    if (this.stopped) throw failure("unavailable", "Transcription substitutions have stopped", 503);
+    if (this.stopped) throw substitutionFailure(this.task, "unavailable", `${this.task === "transcription" ? "Transcription" : "Speech"} substitutions have stopped`, 503);
     if (!Object.values(this.config.rule_sets).some(rules => rules.length > 0)) return;
     if (this.terminating) await this.terminating;
-    if (this.stopped) throw failure("unavailable", "Transcription substitutions have stopped", 503);
+    if (this.stopped) throw substitutionFailure(this.task, "unavailable", `${this.task === "transcription" ? "Transcription" : "Speech"} substitutions have stopped`, 503);
     if (this.state) return this.state.promise;
 
     const options = {
-      workerData: this.config,
+      workerData: { config: this.config, task: this.task },
       execArgv: [],
       resourceLimits: { maxOldGenerationSizeMb: SUBSTITUTION_WORKER_OLD_MEMORY_MB, maxYoungGenerationSizeMb: SUBSTITUTION_WORKER_YOUNG_MEMORY_MB, stackSizeMb: 4 },
     };
@@ -79,7 +78,7 @@ export class AsyncTranscriptSubstitutions {
         worker = new Worker(new URL("./worker.js", import.meta.url), options);
       }
     } catch {
-      const error = failure("unavailable", "The transcription substitution worker could not start", 503);
+      const error = substitutionFailure(this.task, "unavailable", `The ${this.task} substitution worker could not start`, 503);
       this.failPending(error);
       throw error;
     }
@@ -100,15 +99,15 @@ export class AsyncTranscriptSubstitutions {
 
   async apply(text: string, selection?: string | null, signal?: AbortSignal): Promise<SubstitutionResult> {
     signal?.throwIfAborted();
-    if (this.stopped) throw failure("unavailable", "Transcription substitutions have stopped", 503);
+    if (this.stopped) throw substitutionFailure(this.task, "unavailable", `${this.task === "transcription" ? "Transcription" : "Speech"} substitutions have stopped`, 503);
     const ruleSet = selection === undefined ? this.config.default_rule_set : selection;
     if (ruleSet === null) return { text, ruleSet, matches: [] };
-    if (!Object.hasOwn(this.config.rule_sets, ruleSet)) throw failure("configuration", "The selected transcription substitution rule set is unavailable");
+    if (!Object.hasOwn(this.config.rule_sets, ruleSet)) throw substitutionFailure(this.task, "configuration", `The selected ${this.task} substitution rule set is unavailable`);
     if (this.config.rule_sets[ruleSet]!.length === 0) return { text, ruleSet, matches: [] };
     // Reject oversized input before copying it into the worker message queue.
-    if (Buffer.byteLength(text, "utf8") > MAX_TRANSCRIPT_BYTES) throw failure("input_limit", "The transcript exceeds the substitution input limit");
-    if (!isWellFormedUnicode(text)) throw failure("invalid_unicode", "The transcript contains malformed Unicode");
-    if (this.pending.length >= MAX_PENDING_SUBSTITUTIONS) throw failure("busy", "The transcription substitution queue is full", 503);
+    if (Buffer.byteLength(text, "utf8") > MAX_TEXT_BYTES) throw substitutionFailure(this.task, "input_limit", `The ${this.inputLabel} exceeds the substitution input limit`);
+    if (!isWellFormedUnicode(text)) throw substitutionFailure(this.task, "invalid_unicode", `The ${this.inputLabel} contains malformed Unicode`);
+    if (this.pending.length >= MAX_PENDING_SUBSTITUTIONS) throw substitutionFailure(this.task, "busy", `The ${this.task} substitution queue is full`, 503);
 
     return new Promise<SubstitutionResult>((resolve, reject) => {
       const job: Job = {
@@ -124,7 +123,7 @@ export class AsyncTranscriptSubstitutions {
 
   async stop(): Promise<void> {
     this.stopped = true;
-    const error = failure("unavailable", "Transcription substitutions have stopped", 503);
+    const error = substitutionFailure(this.task, "unavailable", `${this.task === "transcription" ? "Transcription" : "Speech"} substitutions have stopped`, 503);
     this.failPending(error);
     const active = this.active;
     this.active = undefined;
@@ -150,7 +149,7 @@ export class AsyncTranscriptSubstitutions {
     if (performance.now() >= job.deadline!) {
       // The worker has already finished. Reject the late result without killing
       // an idle thread or delaying unrelated requests behind another warmup.
-      this.finish(job, deadlineFailure());
+      this.finish(job, this.deadlineFailure());
     } else if (message.type === "result") {
       this.cleanup(job);
       job.resolve(message.result);
@@ -170,7 +169,7 @@ export class AsyncTranscriptSubstitutions {
     // FIFO waiting does not spend another caller's execution budget. Waiting
     // remains bounded by queue capacity, startup limits, and caller cancellation.
     job.deadline = performance.now() + SUBSTITUTION_TIMEOUT_MS;
-    job.timer = setTimeout(() => this.cancel(job, deadlineFailure()), SUBSTITUTION_TIMEOUT_MS);
+    job.timer = setTimeout(() => this.cancel(job, this.deadlineFailure()), SUBSTITUTION_TIMEOUT_MS);
     state.worker.ref();
     state.worker.postMessage({ id: job.id, text: job.text, selection: job.selection } satisfies SubstitutionWorkerRequest);
   }
@@ -192,7 +191,7 @@ export class AsyncTranscriptSubstitutions {
 
   private workerFailed(state: WorkerState): void {
     if (this.state !== state) return;
-    const error = failure("unavailable", "The transcription substitution worker failed", 503);
+    const error = substitutionFailure(this.task, "unavailable", `The ${this.task} substitution worker failed`, 503);
     const active = this.active;
     this.active = undefined;
     if (active) this.cleanup(active);

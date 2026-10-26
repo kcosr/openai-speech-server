@@ -5,12 +5,14 @@ import type { Config } from "../config/schema.js";
 export const MAX_RULE_SETS = 32;
 export const MAX_RULES_PER_SET = 100;
 export const MAX_RULE_TEXT_LENGTH = 1024;
-export const MAX_TRANSCRIPT_BYTES = 65_536;
+export const MAX_TEXT_BYTES = 65_536;
 export const MAX_SUBSTITUTION_MATCHES = 4096;
 export const MAX_RULE_PROGRAM_SIZE = 4096;
 export const MAX_TOTAL_PROGRAM_SIZE = 262_144;
 
-type RuleConfig = Config["transcription_substitutions"]["rule_sets"][string][number];
+export type SubstitutionTask = "transcription" | "speech";
+export type SubstitutionConfig = Config["transcription_substitutions"];
+type RuleConfig = SubstitutionConfig["rule_sets"][string][number];
 type CompiledRule = { config: RuleConfig; expression: RE2JS };
 type Candidate = { start: number; end: number };
 
@@ -59,8 +61,12 @@ export function inspectSubstitutionPattern(pattern: string, caseInsensitive: boo
   return { programSize };
 }
 
-function failure(code: string, message: string): ApiError {
-  return new ApiError(500, "server_error", `transcription_substitution_${code}`, message);
+export function substitutionFailure(task: SubstitutionTask, code: string, message: string, status = 500): ApiError {
+  return new ApiError(status, "server_error", `${task}_substitution_${code}`, message);
+}
+
+export function validateSpeechSubstitutionOutput(input: string, output: string): void {
+  if (output !== input && output.trim().length === 0) throw substitutionFailure("speech", "empty_output", "Pronunciation substitutions left no text to synthesize.");
 }
 
 function isUnicodeBoundary(text: string, index: number): boolean {
@@ -70,27 +76,29 @@ function isUnicodeBoundary(text: string, index: number): boolean {
   return !(previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff);
 }
 
-/** Applies one configured dictionary to the original final transcript. */
-export class TranscriptSubstitutions {
+/** Applies one configured dictionary to the original text without cascading replacements. */
+export class TextSubstitutions {
   private readonly defaultRuleSet: string | null;
   private readonly ruleSets = new Map<string, CompiledRule[]>();
 
-  constructor(config: Config["transcription_substitutions"]) {
+  constructor(config: SubstitutionConfig, private readonly task: SubstitutionTask) {
     this.defaultRuleSet = config.default_rule_set;
     for (const [name, rules] of Object.entries(config.rule_sets)) {
       this.ruleSets.set(name, rules.map(rule => ({ config: rule, expression: compile(rule.pattern, rule.case_insensitive) })));
     }
   }
 
+  private get inputLabel(): string { return this.task === "transcription" ? "transcript" : "speech text"; }
+
   apply(text: string, selection?: string | null): SubstitutionResult {
     const ruleSet = selection === undefined ? this.defaultRuleSet : selection;
     if (ruleSet === null) return { text, ruleSet, matches: [] };
     const rules = this.ruleSets.get(ruleSet);
-    if (!rules) throw failure("configuration", "The selected transcription substitution rule set is unavailable");
+    if (!rules) throw substitutionFailure(this.task, "configuration", `The selected ${this.task} substitution rule set is unavailable`);
     if (rules.length === 0) return { text, ruleSet, matches: [] };
     const inputBytes = Buffer.byteLength(text, "utf8");
-    if (inputBytes > MAX_TRANSCRIPT_BYTES) throw failure("input_limit", "The transcript exceeds the substitution input limit");
-    if (!isWellFormedUnicode(text)) throw failure("invalid_unicode", "The transcript contains malformed Unicode");
+    if (inputBytes > MAX_TEXT_BYTES) throw substitutionFailure(this.task, "input_limit", `The ${this.inputLabel} exceeds the substitution input limit`);
+    if (!isWellFormedUnicode(text)) throw substitutionFailure(this.task, "invalid_unicode", `The ${this.inputLabel} contains malformed Unicode`);
 
     // Matchers retain the original UTF-16 string without copying or re-encoding
     // it. Group-zero offsets are directly usable by JavaScript string slicing.
@@ -102,9 +110,9 @@ export class TranscriptSubstitutions {
       const end = matcher.end();
       // Escaped surrogate literals can trigger a RE2JS literal fast path that
       // splits a valid pair. Reject those spans instead of corrupting Unicode.
-      if (!isUnicodeBoundary(text, start) || !isUnicodeBoundary(text, end)) throw failure("invalid_match", "A transcription substitution expression returned invalid text offsets");
-      if (start === end) throw failure("empty_match", "A transcription substitution expression matched empty text");
-      if (++candidateCount > MAX_SUBSTITUTION_MATCHES) throw failure("work_limit", "The transcript exceeds the substitution processing limit");
+      if (!isUnicodeBoundary(text, start) || !isUnicodeBoundary(text, end)) throw substitutionFailure(this.task, "invalid_match", `A ${this.task} substitution expression returned invalid text offsets`);
+      if (start === end) throw substitutionFailure(this.task, "empty_match", `A ${this.task} substitution expression matched empty text`);
+      if (++candidateCount > MAX_SUBSTITUTION_MATCHES) throw substitutionFailure(this.task, "work_limit", `The ${this.inputLabel} exceeds the substitution processing limit`);
       return { start, end };
     };
 
@@ -115,7 +123,7 @@ export class TranscriptSubstitutions {
     let outputBytes = 0;
     const append = (chunk: string) => {
       outputBytes += Buffer.byteLength(chunk, "utf8");
-      if (outputBytes > MAX_TRANSCRIPT_BYTES) throw failure("output_limit", "The corrected transcript exceeds the substitution output limit");
+      if (outputBytes > MAX_TEXT_BYTES) throw substitutionFailure(this.task, "output_limit", `The ${this.task === "transcription" ? "corrected transcript" : "speech text"} exceeds the substitution output limit`);
       chunks.push(chunk);
     };
     while (true) {

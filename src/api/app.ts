@@ -113,20 +113,23 @@ export async function buildApp(config: Config, authenticator: Authenticator, reg
     if (speed < model.speed.min || speed > model.speed.max) throw invalid("unsupported_speed", `Speed must be between ${model.speed.min} and ${model.speed.max}.`, "speed");
     const streamAbort = new AbortController(); const signal = AbortSignal.any([disconnectSignal, streamAbort.signal]);
     const firstByteTimer = setTimeout(() => streamAbort.abort(new ApiError(504, "server_error", "first_byte_timeout", "Synthesis did not produce audio before the timeout.")), config.server.request_timeout_seconds * 1000);
-    const release = await runtime.queue.acquire(signal); let started = false; let iterator: AsyncIterator<Buffer> | undefined;
+    let release: (() => void) | undefined; let started = false; let iterator: AsyncIterator<Buffer> | undefined;
     try {
-      const chunks = registry.speech(runtime).synthesize({ input: body.input, voice, speed, format: body.response_format, ...(extensions ? { extensions } : {}) }, signal);
+      const speechRequest = await registry.prepareSpeech(runtime, request.client, { input: body.input, voice, speed, format: body.response_format, ...(extensions ? { extensions } : {}) }, signal);
+      release = await runtime.queue.acquire(signal);
+      const chunks = registry.speech(runtime).synthesize(speechRequest, signal);
       iterator = chunks[Symbol.asyncIterator]();
       while (true) {
         const idleTimer = started ? setTimeout(() => streamAbort.abort(new Error("Stream idle timeout")), config.server.stream_idle_timeout_seconds * 1000) : undefined;
-        const next = await iterator.next(); if (idleTimer) clearTimeout(idleTimer);
+        let next: IteratorResult<Buffer>;
+        try { next = await iterator.next(); } finally { if (idleTimer) clearTimeout(idleTimer); }
         if (next.done) { if (signal.aborted) throw signal.reason; break; }
         if (!started) { started = true; clearTimeout(firstByteTimer); reply.raw.setHeader("Content-Type", body.response_format === "pcm" ? `audio/pcm; rate=${model.sample_rate}; channels=${model.channels}; format=s16le` : "audio/wav"); }
         if (!reply.raw.write(next.value)) await waitForDrain(reply.raw, signal, config.server.stream_idle_timeout_seconds * 1000, streamAbort);
       }
       reply.raw.end(); return reply;
     } catch (error) { if (started || reply.raw.headersSent) { reply.raw.destroy(error as Error); return reply; } throw error; }
-    finally { clearTimeout(firstByteTimer); await iterator?.return?.(); release(); }
+    finally { clearTimeout(firstByteTimer); try { await iterator?.return?.(); } finally { release?.(); } }
   }));
 
   app.addHook("onResponse", async (request, reply) => { const route = request.routeOptions.url ?? "unknown"; metrics.requests.inc({ route, status: String(reply.statusCode) }); metrics.duration.observe({ route }, reply.elapsedTime / 1000); });

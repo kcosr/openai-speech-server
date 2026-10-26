@@ -126,7 +126,7 @@ does not invent incremental deltas. Duration equals committed decoded PCM bytes
 divided by 48,000. Input is staged as a 24 kHz WAV and normalized to the worker's
 16 kHz mono WAV with configured ffmpeg.
 
-When [transcription substitutions](../README.md#transcription-substitutions)
+When [transcription substitutions](../README.md#text-substitutions)
 are configured, `transcript` contains the corrected final text. The authenticated
 client inherits the server's default rule set unless its server configuration
 disables substitutions or selects another set. This uses the same processing as

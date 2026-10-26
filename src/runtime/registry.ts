@@ -1,22 +1,25 @@
 import type { Config, ModelConfig, SpeechModelConfig, TranscriptionModelConfig } from "../config/schema.js";
 import type { Client } from "../auth/auth.js";
-import type { Provider, SpeechProvider, TranscriptRequest, TranscriptResult, TranscriptionProvider } from "../providers/types.js";
+import type { Provider, SpeechProvider, SpeechRequest, TranscriptRequest, TranscriptResult, TranscriptionProvider } from "../providers/types.js";
 import { PythonSpeechProvider, PythonTranscriptionProvider } from "../providers/python.js";
 import { WorkerSupervisor } from "../providers/supervisor.js";
 import { ModelQueue } from "./admission.js";
-import { invalid } from "../api/errors.js";
+import { ApiError, invalid } from "../api/errors.js";
 import { ExtensionValidator } from "../extensions/validator.js";
 import { resolveWorkerCommand } from "../providers/command.js";
 import { realtimeCapability } from "./realtime-limits.js";
-import { AsyncTranscriptSubstitutions } from "../transcription/runner.js";
+import { AsyncTextSubstitutions } from "../substitutions/runner.js";
+import { MAX_TEXT_BYTES, validateSpeechSubstitutionOutput } from "../substitutions/substitutions.js";
 
 export type ModelRuntime = { config: ModelConfig; provider: Provider; queue: ModelQueue; extensions: ExtensionValidator };
 
 export class Registry {
   readonly models = new Map<string, ModelRuntime>();
-  private readonly substitutions: AsyncTranscriptSubstitutions;
+  private readonly transcriptionSubstitutions: AsyncTextSubstitutions;
+  private readonly speechSubstitutions: AsyncTextSubstitutions;
   constructor(private readonly config: Config) {
-    this.substitutions = new AsyncTranscriptSubstitutions(config.transcription_substitutions);
+    this.transcriptionSubstitutions = new AsyncTextSubstitutions(config.transcription_substitutions, "transcription");
+    this.speechSubstitutions = new AsyncTextSubstitutions(config.speech_substitutions, "speech");
     for (const model of config.models) {
       const extensions = new ExtensionValidator(model.id, model.extensions);
       if (!model.enabled) continue;
@@ -28,8 +31,8 @@ export class Registry {
       this.models.set(model.id, { config: model, provider, queue: new ModelQueue(model.provider_config.workers, config.server.queue_max_depth, config.server.queue_wait_timeout_seconds * 1000), extensions });
     }
   }
-  async start() { await Promise.all([this.substitutions.start(), ...[...this.models.values()].map(({ provider }) => provider.start())]); }
-  async stop() { await Promise.allSettled([this.substitutions.stop(), ...[...this.models.values()].map(({ provider }) => provider.stop())]); }
+  async start() { await Promise.all([this.transcriptionSubstitutions.start(), this.speechSubstitutions.start(), ...[...this.models.values()].map(({ provider }) => provider.start())]); }
+  async stop() { await Promise.allSettled([this.transcriptionSubstitutions.stop(), this.speechSubstitutions.stop(), ...[...this.models.values()].map(({ provider }) => provider.stop())]); }
   resolve(id: string, task: ModelConfig["task"], client: Client): ModelRuntime {
     const resolvedId = id === "default" ? this.defaultModelId(task, client) : id;
     const runtime = this.models.get(resolvedId);
@@ -40,11 +43,25 @@ export class Registry {
   async transcribe(runtime: ModelRuntime, client: Client, request: TranscriptRequest, signal: AbortSignal): Promise<TranscriptResult> {
     const result = await this.transcription(runtime).transcribe(request, signal);
     signal.throwIfAborted();
-    const corrected = await this.substitutions.apply(result.text, client.transcription_rule_set, signal);
+    const corrected = await this.transcriptionSubstitutions.apply(result.text, client.transcription_rule_set, signal);
     signal.throwIfAborted();
     return { ...result, text: corrected.text };
   }
   speech(runtime: ModelRuntime) { return runtime.provider as SpeechProvider; }
+  async prepareSpeech(runtime: ModelRuntime, client: Client, request: SpeechRequest, signal: AbortSignal): Promise<SpeechRequest> {
+    const prepared = await this.speechSubstitutions.apply(request.input, client.speech_rule_set, signal).catch((error: unknown) => {
+      if (error instanceof ApiError) {
+        if (error.code === "speech_substitution_input_limit") throw invalid("input_too_long", `Input exceeds the speech substitution limit of ${MAX_TEXT_BYTES} UTF-8 bytes.`, "input");
+        if (error.code === "speech_substitution_invalid_unicode") throw invalid("invalid_input", "Input contains malformed Unicode.", "input");
+      }
+      throw error;
+    });
+    signal.throwIfAborted();
+    const model = runtime.config as SpeechModelConfig;
+    if (prepared.text.length > model.max_text_length) throw new ApiError(500, "server_error", "speech_substitution_output_limit", "The pronunciation-adjusted text exceeds the model text limit.");
+    validateSpeechSubstitutionOutput(request.input, prepared.text);
+    return { ...request, input: prepared.text };
+  }
   resolveVoice(model: SpeechModelConfig, client: Client, requested: string | undefined): string {
     const allowed = allowedSpeechVoices(model, client);
     const effectiveDefault = allowed.includes(model.default_voice) ? model.default_voice : allowed[0];
