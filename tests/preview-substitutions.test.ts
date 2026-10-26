@@ -16,10 +16,19 @@ const configuration = {
       alternate: [{ id: "other-name", pattern: "\\bseedus\\b", replacement: "Other" }],
     },
   },
+  speech_substitutions: {
+    default_rule_set: "pronunciation",
+    rule_sets: {
+      pronunciation: [{ id: "letters", pattern: "\\bMR\\b", replacement: "M. R.", case_insensitive: false }],
+      alternate: [{ id: "expanded", pattern: "\\bMR\\b", replacement: "merge request", case_insensitive: false }],
+    },
+  },
   clients: [
     { id: "inherited", token_ref: "first", allowed_models: ["local"] },
-    { id: "disabled", token_ref: "second", allowed_models: ["local"], transcription_rule_set: null },
-    { id: "custom", token_ref: "third", allowed_models: ["local"], transcription_rule_set: "alternate" },
+    { id: "disabled", token_ref: "second", allowed_models: ["local"], transcription_rule_set: null, speech_rule_set: null },
+    { id: "custom", token_ref: "third", allowed_models: ["local"], transcription_rule_set: "alternate", speech_rule_set: "alternate" },
+    { id: "transcription-only-disabled", token_ref: "fourth", allowed_models: ["local"], transcription_rule_set: null },
+    { id: "speech-only-disabled", token_ref: "fifth", allowed_models: ["local"], speech_rule_set: null },
   ],
 };
 
@@ -58,7 +67,29 @@ describe("offline substitution preview", () => {
     expect(JSON.parse(result.stdout)).toEqual({ text: expected, ruleSet, matches });
   });
 
-  it("rejects unknown clients without returning a transcript", () => {
+  it.each([
+    [undefined, "seedus M. R. Mr. MRI", "pronunciation", [{ ruleId: "letters", count: 1 }]],
+    ["inherited", "seedus M. R. Mr. MRI", "pronunciation", [{ ruleId: "letters", count: 1 }]],
+    ["disabled", "seedus MR Mr. MRI", null, []],
+    ["custom", "seedus merge request Mr. MRI", "alternate", [{ ruleId: "expanded", count: 1 }]],
+    ["transcription-only-disabled", "seedus M. R. Mr. MRI", "pronunciation", [{ ruleId: "letters", count: 1 }]],
+    ["speech-only-disabled", "seedus MR Mr. MRI", null, []],
+  ])("previews speech rules independently for client %s without loading a speech model", (client, expected, ruleSet, matches) => {
+    const result = preview("seedus MR Mr. MRI", ["--task", "speech", ...(client === undefined ? [] : ["--client", client as string])]);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(JSON.parse(result.stdout)).toEqual({ text: expected, ruleSet, matches });
+  });
+
+  it("keeps the default and explicit transcription direction independent of speech rules and selection", () => {
+    for (const args of [[], ["--task", "transcription"]]) {
+      const result = preview("seedus MR", [...args, "--client", "speech-only-disabled"]);
+      expect(result.status, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual({ text: "Sedes MR", ruleSet: "common", matches: [{ ruleId: "app-name", count: 1 }] });
+    }
+  });
+
+  it("rejects unknown clients without returning sample text", () => {
     const result = preview("private sample", ["--client", "missing"]);
     expect(result.status).toBe(1);
     expect(result.stdout).toBe("");
@@ -116,6 +147,74 @@ describe("offline substitution preview", () => {
     expect(result.status).toBe(1);
     expect(result.stdout).toBe("");
     expect(result.stderr).toContain("Usage:");
+  });
+
+  it.each(["synthesis", "", "SPEECH"])("rejects unsupported task %s without emitting sample text", task => {
+    const result = preview("private sample", ["--task", task]);
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("--task transcription|speech");
+    expect(result.stderr).not.toContain("private sample");
+  });
+
+  it("reports speech mapping limits with a speech-specific error and no sample text", async () => {
+    await writeFile(configPath, YAML.stringify({
+      ...configuration,
+      speech_substitutions: {
+        default_rule_set: "pronunciation",
+        rule_sets: {
+          ...configuration.speech_substitutions.rule_sets,
+          pronunciation: [{ id: "expansion", pattern: "MR", replacement: "X".repeat(1024) }],
+        },
+      },
+    }));
+    const result = preview("MR ".repeat(65) + "private sample", ["--task", "speech"]);
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("speech_substitution_output_limit");
+    expect(result.stderr).not.toContain("private sample");
+  });
+
+  it.each(["", " \t\n"])("rejects a speech mapping producing only %j without returning sample text", async replacement => {
+    await writeFile(configPath, YAML.stringify({
+      ...configuration,
+      speech_substitutions: {
+        ...configuration.speech_substitutions,
+        rule_sets: {
+          ...configuration.speech_substitutions.rule_sets,
+          pronunciation: [{ id: "erase", pattern: "private sample", replacement }],
+        },
+      },
+    }));
+    const result = preview("private sample", ["--task", "speech"]);
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("speech_substitution_empty_output");
+    expect(result.stderr).not.toContain("private sample");
+  });
+
+  it.each([undefined, "disabled"])("preserves unchanged whitespace in speech previews for client %s", client => {
+    const result = preview(" \t\n", ["--task", "speech", ...(client === undefined ? [] : ["--client", client])]);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(JSON.parse(result.stdout)).toEqual({ text: " \t\n", ruleSet: client === undefined ? "pronunciation" : null, matches: [] });
+  });
+
+  it("continues to allow transcription mappings that delete the entire sample", async () => {
+    await writeFile(configPath, YAML.stringify({
+      ...configuration,
+      transcription_substitutions: {
+        ...configuration.transcription_substitutions,
+        rule_sets: {
+          ...configuration.transcription_substitutions.rule_sets,
+          common: [{ id: "erase", pattern: "private sample", replacement: "" }],
+        },
+      },
+    }));
+    const result = preview("private sample");
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(JSON.parse(result.stdout)).toEqual({ text: "", ruleSet: "common", matches: [{ ruleId: "erase", count: 1 }] });
   });
 
   it("bounds expensive matching and closes its worker before exiting", async () => {

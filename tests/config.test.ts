@@ -28,29 +28,31 @@ describe("configuration", () => {
   it("fails fast when a custom worker command is missing", async () => { const directory = await mkdtemp(join(tmpdir(), "speech-config-")); const path = join(directory, "config.yaml"); try { await writeFile(path, YAML.stringify({ ...base, server: { listen: "127.0.0.1:1", ffmpeg: "/usr/bin/true", prlimit: "/usr/bin/true" }, models: [{ ...base.models[0], provider: "custom", provider_config: { python: process.execPath, command: "/definitely/missing/worker.py" } }] })); await expect(loadConfig(path)).rejects.toThrow(/Worker command.*missing or not readable/); } finally { await rm(directory, { recursive: true, force: true }); } });
 });
 
-describe("transcription substitution configuration", () => {
+describe.each(["transcription", "speech"] as const)("%s substitution configuration", task => {
+  const substitutionsField = `${task}_substitutions` as const;
+  const selectionField = `${task}_rule_set` as const;
   const rule = { id: "name", pattern: "\\b(?:seedus|sedus)\\b", replacement: "Sedes" };
   const substitutions = { default_rule_set: "common", rule_sets: { common: [rule] } };
-  const parse = (value: unknown = substitutions, clients: unknown = base.clients) => ConfigSchema.parse({ ...base, transcription_substitutions: value, clients });
+  const parse = (value: unknown = substitutions, clients: unknown = base.clients) => ConfigSchema.parse({ ...base, [substitutionsField]: value, clients });
 
   it("defaults to disabled and leaves client inheritance distinct from null", () => {
-    expect(ConfigSchema.parse(base).transcription_substitutions).toEqual({ default_rule_set: null, rule_sets: {} });
-    expect(parse({}).transcription_substitutions).toEqual({ default_rule_set: null, rule_sets: {} });
-    const config = parse(substitutions, [{ ...base.clients[0]!, transcription_rule_set: null }]);
-    expect(config.clients[0]!.transcription_rule_set).toBeNull();
-    expect(parse().clients[0]!.transcription_rule_set).toBeUndefined();
-    expect(parse().transcription_substitutions.rule_sets.common?.[0]?.case_insensitive).toBe(true);
+    expect(ConfigSchema.parse(base)[substitutionsField]).toEqual({ default_rule_set: null, rule_sets: {} });
+    expect(parse({})[substitutionsField]).toEqual({ default_rule_set: null, rule_sets: {} });
+    const config = parse(substitutions, [{ ...base.clients[0]!, [selectionField]: null }]);
+    expect(config.clients[0]![selectionField]).toBeNull();
+    expect(parse().clients[0]![selectionField]).toBeUndefined();
+    expect(parse()[substitutionsField].rule_sets.common?.[0]?.case_insensitive).toBe(true);
   });
 
   it("accepts a named client override and an empty replacement", () => {
-    const config = parse({ ...substitutions, rule_sets: { common: [{ ...rule, replacement: "" }] } }, [{ ...base.clients[0]!, transcription_rule_set: "common" }]);
-    expect(config.clients[0]!.transcription_rule_set).toBe("common");
-    expect(config.transcription_substitutions.rule_sets.common?.[0]?.replacement).toBe("");
+    const config = parse({ ...substitutions, rule_sets: { common: [{ ...rule, replacement: "" }] } }, [{ ...base.clients[0]!, [selectionField]: "common" }]);
+    expect(config.clients[0]![selectionField]).toBe("common");
+    expect(config[substitutionsField].rule_sets.common?.[0]?.replacement).toBe("");
   });
 
   it.each(["missing", "constructor", "tostring"])("rejects unknown default and client rule sets: %s", name => {
     expect(() => parse({ ...substitutions, default_rule_set: name })).toThrow(/Unknown default/);
-    expect(() => parse(substitutions, [{ ...base.clients[0]!, transcription_rule_set: name }])).toThrow(/Unknown client/);
+    expect(() => parse(substitutions, [{ ...base.clients[0]!, [selectionField]: name }])).toThrow(/Unknown client/);
   });
 
   it("rejects duplicate rule IDs but allows reuse across sets", () => {
@@ -97,5 +99,24 @@ describe("transcription substitution configuration", () => {
     expect(() => parse({ default: "common", rule_sets: {} })).toThrow();
     expect(() => parse({ rule_sets: { common: [{ ...rule, flags: "i" }] } })).toThrow();
     expect(() => ConfigSchema.parse({ ...base, clients: [{ ...base.clients[0], substitution_rules: [] }] })).toThrow();
+  });
+});
+
+describe("independent substitution configuration", () => {
+  const speech = { default_rule_set: "pronunciation", rule_sets: { pronunciation: [{ id: "merge-request", pattern: "\\bMR\\b", replacement: "M. R.", case_insensitive: false }] } };
+  const transcription = { default_rule_set: "corrections", rule_sets: { corrections: [{ id: "project-name", pattern: "seedus", replacement: "Sedes" }] } };
+
+  it("keeps each task's dictionaries and client selection independent", () => {
+    const config = ConfigSchema.parse({ ...base, speech_substitutions: speech, transcription_substitutions: transcription, clients: [{ ...base.clients[0], speech_rule_set: "pronunciation", transcription_rule_set: "corrections" }] });
+    expect(config.speech_substitutions.rule_sets.pronunciation?.[0]?.replacement).toBe("M. R.");
+    expect(config.transcription_substitutions.rule_sets.corrections?.[0]?.replacement).toBe("Sedes");
+    expect(config.clients[0]).toMatchObject({ speech_rule_set: "pronunciation", transcription_rule_set: "corrections" });
+  });
+
+  it("rejects selections that only exist in the other task's dictionaries", () => {
+    expect(() => ConfigSchema.parse({ ...base, speech_substitutions: speech, transcription_substitutions: transcription, clients: [{ ...base.clients[0], speech_rule_set: "corrections" }] })).toThrow(/Unknown client speech/);
+    expect(() => ConfigSchema.parse({ ...base, speech_substitutions: speech, transcription_substitutions: transcription, clients: [{ ...base.clients[0], transcription_rule_set: "pronunciation" }] })).toThrow(/Unknown client transcription/);
+    expect(() => ConfigSchema.parse({ ...base, speech_substitutions: { ...speech, default_rule_set: "corrections" }, transcription_substitutions: transcription })).toThrow(/Unknown default speech/);
+    expect(() => ConfigSchema.parse({ ...base, speech_substitutions: speech, transcription_substitutions: { ...transcription, default_rule_set: "pronunciation" } })).toThrow(/Unknown default transcription/);
   });
 });

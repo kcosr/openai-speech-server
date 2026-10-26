@@ -1,23 +1,23 @@
 import { describe, expect, it } from "vitest";
 import { ApiError } from "../src/api/errors.js";
 import { ConfigSchema, type Config } from "../src/config/schema.js";
-import { MAX_SUBSTITUTION_MATCHES, MAX_TRANSCRIPT_BYTES, TranscriptSubstitutions, inspectSubstitutionPattern } from "../src/transcription/substitutions.js";
+import { MAX_SUBSTITUTION_MATCHES, MAX_TEXT_BYTES, TextSubstitutions, inspectSubstitutionPattern } from "../src/substitutions/substitutions.js";
 
 type Rule = Config["transcription_substitutions"]["rule_sets"][string][number];
 const rule = (pattern: string, replacement: string, id = "name", caseInsensitive = true): Rule => ({ id, pattern, replacement, case_insensitive: caseInsensitive });
-const create = (...rules: Rule[]) => new TranscriptSubstitutions({ default_rule_set: "common", rule_sets: { common: rules } });
-
-function expectFailure(operation: () => unknown, code: string): void {
-  try {
-    operation();
-    throw new Error("Expected substitutions to fail");
-  } catch (error) {
-    expect(error).toBeInstanceOf(ApiError);
-    expect(error).toMatchObject({ status: 500, type: "server_error", code: `transcription_substitution_${code}` });
+describe.each(["transcription", "speech"] as const)("%s substitutions", task => {
+  const createEngine = (config: Config["transcription_substitutions"]) => new TextSubstitutions(config, task);
+  const create = (...rules: Rule[]) => createEngine({ default_rule_set: "common", rule_sets: { common: rules } });
+  function expectFailure(operation: () => unknown, code: string): void {
+    try {
+      operation();
+      throw new Error("Expected substitutions to fail");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ApiError);
+      expect(error).toMatchObject({ status: 500, type: "server_error", code: `${task}_substitution_${code}` });
+    }
   }
-}
 
-describe("transcription substitutions", () => {
   it("maps grouped variations globally with case-insensitive matching by default", () => {
     const result = create(rule("\\b(?:seedes|seedus|sedus)\\b", "Sedes")).apply("SEEDUS, sedus and seedes; xsedus stays.");
     expect(result).toEqual({ text: "Sedes, Sedes and Sedes; xsedus stays.", ruleSet: "common", matches: [{ ruleId: "name", count: 3 }] });
@@ -63,16 +63,16 @@ describe("transcription substitutions", () => {
   });
 
   it("inherits a default, disables with null, and replaces the default for a named override", () => {
-    const engine = new TranscriptSubstitutions({ default_rule_set: "common", rule_sets: { common: [rule("seedus", "Sedes")], other: [rule("hello", "Hi")] } });
+    const engine = createEngine({ default_rule_set: "common", rule_sets: { common: [rule("seedus", "Sedes")], other: [rule("hello", "Hi")] } });
     expect(engine.apply("hello seedus").text).toBe("hello Sedes");
     expect(engine.apply("hello seedus", null)).toEqual({ text: "hello seedus", ruleSet: null, matches: [] });
     expect(engine.apply("hello seedus", "other")).toEqual({ text: "Hi seedus", ruleSet: "other", matches: [{ ruleId: "name", count: 1 }] });
     expect(engine.apply("hello seedus").text).toBe("hello Sedes");
   });
 
-  it("has no transcript limits or effects when substitutions are disabled or empty", () => {
-    const text = "a".repeat(MAX_TRANSCRIPT_BYTES + 1);
-    const disabled = new TranscriptSubstitutions({ default_rule_set: null, rule_sets: {} });
+  it("has no text limits or effects when substitutions are disabled or empty", () => {
+    const text = "a".repeat(MAX_TEXT_BYTES + 1);
+    const disabled = createEngine({ default_rule_set: null, rule_sets: {} });
     expect(disabled.apply(text)).toEqual({ text, ruleSet: null, matches: [] });
     expect(create().apply(text)).toEqual({ text, ruleSet: "common", matches: [] });
     expect(create(rule("a", "b")).apply(text, null).text).toBe(text);
@@ -80,27 +80,27 @@ describe("transcription substitutions", () => {
 
   it("never resolves inherited object properties as rule sets", () => {
     expectFailure(() => create(rule("a", "b")).apply("a", "constructor"), "configuration");
-    const engine = new TranscriptSubstitutions({ default_rule_set: "constructor", rule_sets: { constructor: [rule("a", "b")] } });
+    const engine = createEngine({ default_rule_set: "constructor", rule_sets: { constructor: [rule("a", "b")] } });
     expect(engine.apply("a").text).toBe("b");
   });
 
-  it("bounds active transcript input by UTF-8 bytes", () => {
+  it("bounds active text input by UTF-8 bytes", () => {
     const engine = create(rule("absent", "present"));
-    const text = "😀".repeat(MAX_TRANSCRIPT_BYTES / 4);
+    const text = "😀".repeat(MAX_TEXT_BYTES / 4);
     expect(engine.apply(text).text).toBe(text);
     expectFailure(() => engine.apply(text + "a"), "input_limit");
   });
 
   it("bounds expanded output by UTF-8 bytes without returning partial text", () => {
     const engine = create(rule("a", "é".repeat(1024)));
-    expect(Buffer.byteLength(engine.apply("a".repeat(32)).text)).toBe(MAX_TRANSCRIPT_BYTES);
+    expect(Buffer.byteLength(engine.apply("a".repeat(32)).text)).toBe(MAX_TEXT_BYTES);
     expectFailure(() => engine.apply("a".repeat(33)), "output_limit");
     expect(engine.apply("a").text).toBe("é".repeat(1024));
   });
 
   it("bounds dense candidate counts and remains usable afterward", () => {
     const engine = create(rule("a", "b"));
-    expectFailure(() => engine.apply("a".repeat(MAX_TRANSCRIPT_BYTES)), "work_limit");
+    expectFailure(() => engine.apply("a".repeat(MAX_TEXT_BYTES)), "work_limit");
     expect(engine.apply("a").text).toBe("b");
     expect(engine.apply("a".repeat(MAX_SUBSTITUTION_MATCHES)).text).toBe("b".repeat(MAX_SUBSTITUTION_MATCHES));
   });
@@ -129,7 +129,7 @@ describe("transcription substitutions", () => {
     expect(create(rule(String.raw`\Q\C\E`, "literal")).apply(String.raw`use \C`).text).toBe("use literal");
   });
 
-  it.each(["\ud800seedus", "seedus\udc00", "\ud800\ud800", "\udc00\ud800"])("fails explicitly for malformed transcript Unicode", text => {
+  it.each(["\ud800seedus", "seedus\udc00", "\ud800\ud800", "\udc00\ud800"])("fails explicitly for malformed text Unicode", text => {
     const engine = create(rule("seedus", "Sedes"));
     expectFailure(() => engine.apply(text), "invalid_unicode");
     expect(engine.apply("😀seedus").text).toBe("😀Sedes");
@@ -140,10 +140,10 @@ describe("transcription substitutions", () => {
     expectFailure(() => create(rule(pattern, "broken")).apply("😀seedus"), "invalid_match");
   });
 
-  it("corrects dense 64-KiB transcripts with 100 rules without a whole-input copy budget", () => {
+  it("corrects dense 64-KiB text with 100 rules without a whole-input copy budget", () => {
     const rules = [rule("\\bseedus\\b", "Sedes"), ...Array.from({ length: 99 }, (_, index) => rule(`unused-${index}`, "other", `unused-${index}`))];
     const text = "seedus complete ".repeat(4096);
-    expect(Buffer.byteLength(text)).toBe(MAX_TRANSCRIPT_BYTES);
+    expect(Buffer.byteLength(text)).toBe(MAX_TEXT_BYTES);
     const engine = create(...rules);
     for (let attempt = 0; attempt < 3; attempt++) {
       const result = engine.apply(text);
@@ -167,7 +167,7 @@ describe("transcription substitutions", () => {
     const text = "ordinary words ".repeat(273) + "zz42";
     for (let attempt = 0; attempt < 3; attempt++) {
       for (const config of rules) expect(inspectSubstitutionPattern(config.pattern, config.case_insensitive).error).toBeUndefined();
-      const engine = new TranscriptSubstitutions({ default_rule_set: "common", rule_sets: { common: rules, other: rules } });
+      const engine = createEngine({ default_rule_set: "common", rule_sets: { common: rules, other: rules } });
       for (const selection of ["common", "other"]) {
         const result = engine.apply(text, selection);
         expect(result.text).toBe("ordinary words ".repeat(269) + "translated-42");
@@ -184,9 +184,9 @@ describe("transcription substitutions", () => {
       server: { listen: "127.0.0.1:1" }, auth: { tokens_file: "/unused" },
       models: [{ id: "stt", task: "transcription", provider: "parakeet", provider_config: { python: "python3" } }],
       clients: [{ id: "test", token_ref: "test", allowed_models: ["stt"] }],
-      transcription_substitutions: { default_rule_set: "set-0", rule_sets: Object.fromEntries(Array.from({ length: 32 }, (_, set) => [`set-${set}`, Array.from({ length: 100 }, (_, index) => rule(pattern, `result-${set}`, `rule-${index}`))])) },
+      [`${task}_substitutions`]: { default_rule_set: "set-0", rule_sets: Object.fromEntries(Array.from({ length: 32 }, (_, set) => [`set-${set}`, Array.from({ length: 100 }, (_, index) => rule(pattern, `result-${set}`, `rule-${index}`))])) },
     });
-    const engine = new TranscriptSubstitutions(config.transcription_substitutions);
+    const engine = createEngine(config[`${task}_substitutions`]);
     for (let set = 0; set < 32; set++) expect(engine.apply(pattern, `set-${set}`).text).toBe(`result-${set}`);
     expect(engine.apply("😀" + pattern + " tail").text).toBe("😀result-0 tail");
   }, 15_000);
