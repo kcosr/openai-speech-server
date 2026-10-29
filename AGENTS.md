@@ -1,8 +1,9 @@
 # Repository guide
 
 Run installs, tests, and builds with `NODE_ENV` unset. Use `npm ci`,
-`npm run check`, and `npm run build`. Audio tests require ffmpeg; set
-`OPENAI_SPEECH_FFMPEG` to an audio-capable executable when necessary.
+`npm run check`, and `npm run build`. Audio tests require ffmpeg with the
+`libopus` encoder and an Opus decoder; set `OPENAI_SPEECH_FFMPEG` to the
+absolute path of a matching executable when necessary.
 Real model/GPU and deployed-server smoke checks are separate from fixture tests.
 
 ## Changelog and releases

@@ -79,10 +79,96 @@ without inheriting hints the new model does not support. Omitted nested fields
 retain their values during other updates; null or empty language strings are
 not supported reset forms.
 
-Only 24 kHz `audio/pcm`, null noise reduction, null turn detection, and an empty
-`include` list are supported. Unknown fields, beta event aliases, conversational
+The standard protocol supports 24 kHz `audio/pcm`, null noise reduction, null
+turn detection, and an empty `include` list. Unknown fields, beta event aliases, conversational
 sessions, server VAD, logprobs, provider extensions, and `response.*` fail with
 an error event. The server does not require an `OpenAI-Beta` header.
+
+## Optional binary audio extension
+
+Standard clients continue using JSON/Base64 PCM without any new fields. Clients
+may opt into this server's versioned extension only when the selected model's
+capabilities advertise `realtime_extensions.binary_audio_input`. This optional
+model-level field is separate from the existing closed `realtime` limits object:
+
+```json
+{
+  "binary_audio_input": {
+    "versions": [1],
+    "formats": [
+      {"type": "audio/pcm", "rate": 24000},
+      {"type": "audio/ogg", "codec": "opus"}
+    ]
+  }
+}
+```
+
+Every transcription model advertises binary PCM. Ogg Opus appears only when
+the model's configured `input_formats` includes `ogg`. Absence of this extension
+on another compatible server means the client should use the standard protocol;
+selecting a self-hosted provider does not establish extension support.
+
+Enable binary input and select its format together:
+
+```json
+{
+  "type": "session.update",
+  "session": {
+    "type": "transcription",
+    "extensions": {"binary_audio_input": {"version": 1}},
+    "audio": {"input": {
+      "format": {"type": "audio/ogg", "codec": "opus"},
+      "transcription": {"model": "parakeet-local"},
+      "noise_reduction": null,
+      "turn_detection": null
+    }}
+  }
+}
+```
+
+Wait for `session.updated` to echo the exact effective format and extension
+before sending audio. Binary PCM uses `{"type":"audio/pcm","rate":24000}`
+with the same extension. Codec bitrate is an encoder choice, not a session
+setting. This extension is specific to this server; it is not part of OpenAI's
+Realtime protocol. No alternate route or WebSocket subprotocol is needed.
+
+Version 1 has three supported combinations:
+
+| Format | Extension | Audio messages |
+| --- | --- | --- |
+| PCM16LE mono 24 kHz | Absent | Standard JSON/Base64 append events |
+| PCM16LE mono 24 kHz | Version 1 | Binary messages containing whole samples |
+| Ogg Opus mono | Version 1 | Binary messages containing complete Ogg pages |
+
+Mixing JSON appends with negotiated binary input, unnegotiated binary messages,
+unsupported versions, and unsupported format combinations fail explicitly.
+Control and result events remain JSON. Partial updates retain the extension;
+to disable it, set `session.extensions.binary_audio_input` to null and select
+PCM in the same update. Disabled sessions omit `extensions` from their
+description. All updates remain atomic and require an empty buffer and no job.
+
+Each committed Opus buffer is an independent Ogg logical stream. Version 1
+requires a separate mono version-1 `OpusHead` BOS page (mapping family 0,
+zero output gain), followed by a separate `OpusTags` page without trailing
+padding. Page sequence numbers start at zero and increase with one stream
+serial. Each binary message contains one or more complete pages; packets must
+not span pages, pages must not be empty, and all checksums must match. These
+restrictions describe a streaming subset of Ogg Opus.
+
+Audio packet framing follows RFC 6716 with mono packets and at most 120 ms per
+packet. Nonfinal granules equal cumulative packet duration in **48 kHz samples**,
+regardless of the encoder input rate. The final audio page must carry EOS;
+its granule may trim up to the last packet's duration, cannot precede the
+previous page, and must include at least the header's pre-skip. For `N` source
+samples captured at 24 kHz, the exact final granule is `pre_skip + 2*N`.
+The encoder must drain its delayed output before EOS. A typical client batches
+about 100 ms per page while retaining its final packet for end trimming.
+
+Commit requires EOS and at least 100 ms after pre-skip/end trimming. The server
+validates packet durations as well as declared granules, then checks that
+ffmpeg's normalized sample count agrees within two 16 kHz samples of resampler
+rounding. It never infers duration from compressed byte count. Commit or clear
+resets the Ogg stream; chained streams inside one buffer are rejected.
 
 ## Audio and results
 
@@ -92,9 +178,9 @@ an error event. The server does not require an `OpenAI-Beta` header.
 | `input_audio_buffer.clear` | No additional fields | Clears uncommitted audio and sends `input_audio_buffer.cleared` |
 | `input_audio_buffer.commit` | No additional fields | Requires at least 100 ms, clears the input buffer, and starts one batch transcription |
 
-Every client event may have a string `event_id` of at most 256 characters.
-Binary WebSocket messages are unsupported. Invalid audio is rejected before
-inference. Model duration and configured byte limits apply to each buffer.
+Every JSON client event may have a string `event_id` of at most 256 characters.
+Binary messages have no event ID. Invalid audio is rejected before inference.
+Model duration and configured byte limits apply to each buffer.
 
 The commit acknowledgment establishes ordering and result correlation:
 
@@ -108,7 +194,9 @@ The commit acknowledgment establishes ordering and result correlation:
 ```
 
 `previous_item_id` is null for the first commit and the preceding committed item
-ID thereafter. Final success is:
+ID thereafter. This acknowledgment confirms receipt in session memory; it is
+not a durable upload receipt. Clients should budget upload/commit acknowledgment
+separately from the subsequent inference deadline. Final success is:
 
 ```json
 {
@@ -123,8 +211,9 @@ ID thereafter. Final success is:
 
 Parakeet is a batch model, so this service emits only the final transcript. It
 does not invent incremental deltas. Duration equals committed decoded PCM bytes
-divided by 48,000. Input is staged as a 24 kHz WAV and normalized to the worker's
-16 kHz mono WAV with configured ffmpeg.
+divided by 48,000, or final Opus granule minus pre-skip divided by 48,000.
+PCM is staged as a 24 kHz WAV; Opus retains its validated Ogg container.
+Both normalize to the worker's 16 kHz mono WAV with configured ffmpeg.
 
 When [transcription substitutions](../README.md#text-substitutions)
 are configured, `transcript` contains the corrected final text. The authenticated
@@ -219,7 +308,11 @@ integers, and time limits are positive seconds, potentially fractional, up to
 because Node timers would otherwise expire them immediately. Very
 small configured model limits are reported as-is, including a zero-byte buffer
 if the duration cannot hold one sample; discovery never raises a limit to make
-a client usable. The WebSocket enforces the same effective buffer bound.
+a client usable. The WebSocket enforces the same effective buffer bound. For
+binary Opus the same numeric value independently bounds **compressed bytes**
+and decoded duration in **48 kHz samples after pre-skip/end trimming**. Encoder
+delay and at most one final packet of end padding are validated separately.
+Compression cannot bypass the model's duration limit or admit unbounded data.
 
 Clients should fetch capabilities for the exact selected model before starting
 recording and compare them with their packet sizes, transcript bounds and
@@ -229,7 +322,7 @@ These are derived capability fields, not new operator configuration keys.
 | `server.realtime` field | Default | Meaning |
 | --- | --- | --- |
 | `max_buffer_bytes` | 5,760,000 | 120 seconds of decoded PCM per buffer; lower model duration also applies |
-| `max_message_bytes` | 1,048,576 | Maximum complete WebSocket JSON message |
+| `max_message_bytes` | 1,048,576 | Maximum complete WebSocket text or binary message |
 | `max_output_bytes` | 1,048,576 | Maximum pending outbound data including the next event |
 | `idle_timeout_seconds` | 60 | Idle connection deadline while no job is running |
 | `max_session_seconds` | 3,600 | Session lifetime, including recording and inference |
@@ -254,11 +347,19 @@ Inference uses `request_timeout_seconds`; normalization and worker cancellation
 use their existing configured deadlines. Audio exceeding a limit fails
 explicitly and is never silently truncated.
 
-Normalization limits the output to the committed PCM duration at 16 kHz plus
+Normalization limits the output to the committed audio duration at 16 kHz plus
 bounded WAV overhead; the HTTP `max_upload_bytes` setting does not limit this
-Realtime path. Because the server creates the canonical WAV input, decoder or
-output-limit failures on this path are server faults (`normalization_failed`),
-not client upload errors. Normalization deadlines retain `normalization_timeout`.
+Realtime path. For PCM, the server creates canonical WAV input, so decoder or
+output-limit failures are server faults (`normalization_failed`). For Opus,
+invalid compressed input remains a client error (`invalid_audio` or
+`decoded_audio_too_large`) rather than an internal server failure.
+Normalization deadlines retain `normalization_timeout`.
+Client-classified compressed normalization failures also produce warning-level
+logs, so operators can investigate decoder or resource problems even when the
+client receives `invalid_audio`. Unexpected server faults retain error-level
+logs, and normalization timeouts retain deadline warnings. Logs contain
+classifications and IDs only, never decoder
+stderr, audio, transcripts, or credentials.
 Unexpected failures and deadlines are logged using the HTTP
 request ID, session ID, committed item ID, processing phase, and error
 classification. These diagnostics exclude raw errors, audio, transcripts,
