@@ -4,7 +4,7 @@
 
 ### Added
 
-- Optional negotiated binary PCM and Ogg Opus transcription uploads, with per-model discovery and unchanged standard JSON/Base64 clients.
+- Optional negotiated binary PCM and Ogg Opus transcription uploads, with per-model discovery and unchanged standard JSON/Base64 clients. ([#7](https://github.com/kcosr/openai-speech-server/pull/7))
 - Configurable pronunciation mappings for speech synthesis, with independent client overrides and offline previews. ([#6](https://github.com/kcosr/openai-speech-server/pull/6))
 
 ## [0.1.2] - 2026-10-14
