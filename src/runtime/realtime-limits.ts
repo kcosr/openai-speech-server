@@ -21,3 +21,11 @@ export function effectiveRealtimeBufferBytes(settings: Config["server"]["realtim
 export function realtimeCapability(settings: Config["server"]["realtime"], model: TranscriptionModelConfig): RealtimeCapability {
   return RealtimeCapabilitySchema.parse({ ...settings, max_buffer_bytes: effectiveRealtimeBufferBytes(settings, model) });
 }
+
+/** Optional protocol capabilities live beside the existing closed limits object. */
+export function realtimeExtensions(model: TranscriptionModelConfig) {
+  return { binary_audio_input: { versions: [1], formats: [
+    { type: "audio/pcm", rate: 24000 },
+    ...(model.input_formats.includes("ogg") ? [{ type: "audio/ogg", codec: "opus" }] : []),
+  ] } };
+}

@@ -1,16 +1,23 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { once } from "node:events";
-import { mkdir, readdir, rm } from "node:fs/promises";
+import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { WebSocket } from "ws";
 import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/api/app.js";
 import { Authenticator } from "../src/auth/auth.js";
 import { Registry } from "../src/runtime/registry.js";
-import { testConfig, TOKEN } from "./helpers.js";
+import { testConfig, TOKEN, wav } from "./helpers.js";
 import type { Config } from "../src/config/schema.js";
+import { page, head, silenceStream } from "./ogg-helpers.js";
 
 const configuration = (transcription: Record<string, unknown> = { model: "parakeet-local" }) => ({ type: "session.update", session: { type: "transcription", audio: { input: { format: { type: "audio/pcm", rate: 24000 }, transcription, noise_reduction: null, turn_detection: null } } } });
 const pcm = Buffer.alloc(9600); // 200 ms at 24 kHz, mono s16le
+const binaryConfiguration = (ogg = false, transcription: Record<string, unknown> = { model: "parakeet-local" }) => ({
+  type: "session.update", session: { type: "transcription", extensions: { binary_audio_input: { version: 1 } }, audio: { input: {
+    format: ogg ? { type: "audio/ogg", codec: "opus" } : { type: "audio/pcm", rate: 24000 }, transcription, noise_reduction: null, turn_detection: null,
+  } } },
+});
 class Peer {
   readonly events: any[] = [];
   constructor(readonly socket: WebSocket) { socket.on("message", (data) => this.events.push(JSON.parse(data.toString()))); socket.on("error", () => undefined); }
@@ -25,7 +32,9 @@ describe("Realtime transcription over real WebSockets", () => {
   async function boot(overrides = {}, concurrency = 2, configure?: (config: Config) => void, diagnostics?: unknown[]) {
     const config = await testConfig(overrides, concurrency); configure?.(config); const registry = new Registry(config); await registry.start();
     app = await buildApp(config, await Authenticator.create(config), registry); app.log.level = "silent";
-    if (diagnostics) app.addHook("onRequest", async (request) => { vi.spyOn(request.log, "error").mockImplementation((fields, message) => { diagnostics.push({ request_id: request.id, fields, message }); }); });
+    if (diagnostics) app.addHook("onRequest", async (request) => {
+      for (const level of ["error", "warn"] as const) vi.spyOn(request.log, level).mockImplementation((fields, message) => { diagnostics.push({ level, request_id: request.id, fields, message }); });
+    });
     const url = await app.listen({ host: "127.0.0.1", port: 0 });
     async function connect(query = "intent=transcription", token = TOKEN) {
       const peer = new Peer(new WebSocket(`${url.replace("http:", "ws:")}/v1/realtime?${query}`, { headers: { Authorization: `Bearer ${token}` } })); peers.push(peer);
@@ -81,6 +90,135 @@ describe("Realtime transcription over real WebSockets", () => {
     expect(peer.events.some((event) => event.type.endsWith(".delta"))).toBe(false);
     expect(registry.models.get("parakeet-local")!.provider.restartCount).toBe(0);
   });
+  it.each([false, true])("negotiates binary audio (Opus=%s), echoes exact settings and normalizes successive segments", async (ogg) => {
+    const { config, connect } = await boot(); const peer = await connect();
+    expect((await peer.next("session.created")).session).not.toHaveProperty("extensions");
+    const update = binaryConfiguration(ogg); peer.send(update);
+    const accepted = (await peer.next("session.updated")).session;
+    expect(accepted.audio.input.format).toEqual(update.session.audio.input.format);
+    expect(accepted.extensions).toEqual({ binary_audio_input: { version: 1 } });
+    let previous: string | null = null;
+    for (let segment = 0; segment < 2; segment++) {
+      const audio = ogg ? silenceStream() : [pcm];
+      for (const chunk of audio) peer.socket.send(chunk);
+      peer.send({ type: "input_audio_buffer.commit" });
+      const committed = await peer.next("input_audio_buffer.committed"); expect(committed.previous_item_id).toBe(previous); previous = committed.item_id;
+      expect(await peer.next("conversation.item.input_audio_transcription.completed")).toMatchObject({ item_id: committed.item_id, transcript: "test transcript", usage: { seconds: 0.2 } });
+    }
+    await expect.poll(async () => (await readdir(config.server.temp_directory)).filter((path) => /\.(wav|ogg)$/.test(path))).toEqual([]);
+  });
+  it("requires explicit binary negotiation, rejects mixed transports and allows explicit return to standard PCM", async () => {
+    const { connect } = await boot(); const peer = await connect(); peer.send(configuration()); await peer.next("session.updated");
+    peer.socket.send(pcm); expect((await peer.next("error")).error.code).toBe("invalid_event");
+    peer.send(binaryConfiguration()); await peer.next("session.updated");
+    peer.append(); expect((await peer.next("error")).error.code).toBe("invalid_event");
+    peer.socket.send(Buffer.alloc(3)); expect((await peer.next("error")).error.code).toBe("invalid_audio");
+    peer.send({ ...configuration(), session: { ...configuration().session, extensions: { binary_audio_input: null } } });
+    expect((await peer.next("session.updated")).session).not.toHaveProperty("extensions");
+    peer.append(); peer.send({ type: "input_audio_buffer.commit" }); await peer.next("conversation.item.input_audio_transcription.completed");
+  });
+  it("validates format, extension version and model support atomically", async () => {
+    const { connect } = await boot({}, 2, (config) => { config.models.find((entry) => entry.task === "transcription")!.input_formats = ["wav"]; });
+    const peer = await connect(); peer.send(configuration()); await peer.next("session.updated");
+    const ogg = binaryConfiguration(true);
+    peer.send({ ...ogg, session: { ...ogg.session, extensions: undefined } });
+    expect((await peer.next("error")).error.code).toBe("unsupported_audio_format");
+    peer.send({ ...ogg, session: { ...ogg.session, extensions: { binary_audio_input: { version: 2 } } } });
+    expect((await peer.next("error")).error.code).toBe("invalid_event");
+    peer.send(ogg); expect((await peer.next("error")).error.code).toBe("unsupported_audio_format");
+    peer.send({ type: "session.update", session: { type: "transcription" } });
+    const session = (await peer.next("session.updated")).session;
+    expect(session.audio.input.format).toEqual({ type: "audio/pcm", rate: 24000 }); expect(session).not.toHaveProperty("extensions");
+    peer.append(); peer.send({ type: "input_audio_buffer.commit" }); await peer.next("conversation.item.input_audio_transcription.completed");
+  });
+  it("requires valid Ogg pages and EOS, and resets codec state on clear", async () => {
+    const { connect, registry } = await boot(); const peer = await connect(); peer.send(binaryConfiguration(true)); await peer.next("session.updated");
+    peer.socket.send(pcm); expect((await peer.next("error")).error.code).toBe("invalid_audio");
+    peer.socket.send(silenceStream()[0]!); peer.send({ type: "input_audio_buffer.commit" });
+    expect((await peer.next("error")).error.code).toBe("invalid_audio");
+    peer.send(configuration()); expect((await peer.next("error")).error.code).toBe("session_busy");
+    expect(registry.models.get("parakeet-local")!.provider.inFlight).toBe(0);
+    peer.send({ type: "input_audio_buffer.clear" }); await peer.next("input_audio_buffer.cleared");
+    peer.socket.send(Buffer.concat(silenceStream(2400))); peer.send({ type: "input_audio_buffer.commit" });
+    expect((await peer.next("error")).error.code).toBe("input_audio_buffer_commit_empty");
+    peer.send({ type: "input_audio_buffer.clear" }); await peer.next("input_audio_buffer.cleared");
+    peer.socket.send(Buffer.concat(silenceStream())); peer.send({ type: "input_audio_buffer.commit" }); await peer.next("conversation.item.input_audio_transcription.completed");
+  });
+  it("rejects Ogg binary opt-out without PCM atomically and preserves the next Opus segment", async () => {
+    const { connect } = await boot(); const peer = await connect(); peer.send(binaryConfiguration(true)); await peer.next("session.updated");
+    peer.send({ type: "session.update", session: { type: "transcription", extensions: { binary_audio_input: null } } });
+    expect((await peer.next("error")).error.code).toBe("unsupported_audio_format");
+    peer.send({ type: "session.update", session: { type: "transcription" } });
+    const session = (await peer.next("session.updated")).session;
+    expect(session.audio.input.format).toEqual({ type: "audio/ogg", codec: "opus" });
+    expect(session.extensions).toEqual({ binary_audio_input: { version: 1 } });
+    peer.socket.send(Buffer.concat(silenceStream())); peer.send({ type: "input_audio_buffer.commit" });
+    expect(await peer.next("conversation.item.input_audio_transcription.completed")).toMatchObject({ transcript: "test transcript", usage: { seconds: 0.2 } });
+  });
+  it("bounds compressed bytes, decoded duration and binary messages separately", async () => {
+    const { connect } = await boot({ realtime: { max_buffer_bytes: 4800, max_message_bytes: 16000 } });
+    for (const kind of ["duration", "bytes", "message"]) {
+      const peer = await connect(); peer.send(binaryConfiguration(true)); await peer.next("session.updated"); const closed = once(peer.socket, "close");
+      if (kind === "duration") peer.socket.send(Buffer.concat(silenceStream()));
+      else if (kind === "bytes") {
+        const metadata = Buffer.alloc(5000); metadata.write("OpusTags"); metadata.writeUInt32LE(4984, 8);
+        peer.socket.send(Buffer.concat([page([head()], 0, 0, 2), page([metadata], 1, 0)]));
+      } else peer.socket.send(Buffer.alloc(16001));
+      if (kind !== "message") expect((await peer.next("error")).error.code).toBe("audio_buffer_overflow");
+      expect((await closed)[0]).toBe(1009);
+    }
+  });
+  it("retains the next independent Ogg stream while the preceding inference runs", async () => {
+    const { connect } = await boot(); const peer = await connect(); peer.send(binaryConfiguration(true, { model: "parakeet-local", language: "slow" })); await peer.next("session.updated");
+    peer.socket.send(Buffer.concat(silenceStream())); peer.send({ type: "input_audio_buffer.commit" }); await peer.next("input_audio_buffer.committed");
+    peer.socket.send(Buffer.concat(silenceStream())); peer.send({ type: "input_audio_buffer.commit" });
+    expect((await peer.next("error")).error.code).toBe("transcription_busy");
+    await peer.next("conversation.item.input_audio_transcription.completed");
+    peer.send({ type: "input_audio_buffer.commit" }); await peer.next("conversation.item.input_audio_transcription.completed");
+  });
+  it("logs compressed decode failure metadata while preserving client invalid_audio", async () => {
+    const diagnostics: unknown[] = []; const { connect } = await boot({ ffmpeg: "/usr/bin/false" }, 2, undefined, diagnostics);
+    const peer = await connect(); const created = await peer.next("session.created"); peer.send(binaryConfiguration(true)); await peer.next("session.updated");
+    peer.socket.send(Buffer.concat(silenceStream())); peer.send({ type: "input_audio_buffer.commit" }); const committed = await peer.next("input_audio_buffer.committed");
+    expect(await peer.next("conversation.item.input_audio_transcription.failed")).toMatchObject({ error: { code: "invalid_audio", param: "audio" } });
+    expect(diagnostics).toEqual([{ level: "warn", request_id: expect.stringMatching(/^req_/), fields: { session_id: created.session.id, item_id: committed.item_id, phase: "normalization", code: "invalid_audio", status: 400 }, message: "Realtime compressed audio normalization failed" }]);
+  });
+  it.each(["fault", "timeout"])("preserves Opus normalization %s severity and diagnostics", async (failure) => {
+    const diagnostics: unknown[] = [];
+    const overrides = failure === "fault" ? { prlimit: "/missing/opus-normalization-prlimit" } : { normalization_timeout_seconds: 0.05 };
+    const { connect, config, registry } = await boot(overrides, 2, undefined, diagnostics);
+    const stub = failure === "timeout" ? join(config.server.temp_directory, "slow-ffmpeg") : undefined;
+    if (stub) { await writeFile(stub, "#!/usr/bin/env python3\nimport time\ntime.sleep(10)\n", { mode: 0o700 }); config.server.ffmpeg = stub; }
+    const transcribe = vi.spyOn(registry, "transcribe");
+    try {
+      const peer = await connect(); const created = await peer.next("session.created"); peer.send(binaryConfiguration(true)); await peer.next("session.updated");
+      peer.socket.send(Buffer.concat(silenceStream())); peer.send({ type: "input_audio_buffer.commit" }); const committed = await peer.next("input_audio_buffer.committed");
+      const code = failure === "fault" ? "transcription_failed" : "normalization_timeout";
+      expect(await peer.next("conversation.item.input_audio_transcription.failed")).toMatchObject({ item_id: committed.item_id, error: { code } });
+      expect(transcribe).not.toHaveBeenCalled();
+      expect(diagnostics).toEqual([{
+        level: failure === "fault" ? "error" : "warn", request_id: expect.stringMatching(/^req_/),
+        fields: { session_id: created.session.id, item_id: committed.item_id, phase: "normalization", code, status: failure === "fault" ? 500 : 504 },
+        message: failure === "fault" ? "Realtime transcription failed" : "Realtime transcription deadline exceeded",
+      }]);
+      expect(JSON.stringify(diagnostics)).not.toContain("/missing/opus-normalization-prlimit");
+    } finally { if (stub) await rm(stub); }
+  });
+  it("rejects mismatched decoded Opus duration before inference and logs metadata only", async () => {
+    const diagnostics: unknown[] = []; const { connect, config, registry } = await boot({}, 2, undefined, diagnostics);
+    const stub = join(config.server.temp_directory, "short-ffmpeg");
+    const sensitive = `private decoder details ${TOKEN}`;
+    await writeFile(stub, `#!/usr/bin/env python3\nimport base64, pathlib, sys\nprint(${JSON.stringify(sensitive)}, file=sys.stderr)\npathlib.Path(sys.argv[-1]).write_bytes(base64.b64decode(${JSON.stringify(wav().toString("base64"))}))\n`, { mode: 0o700 });
+    config.server.ffmpeg = stub;
+    const transcribe = vi.spyOn(registry, "transcribe");
+    const peer = await connect(); const created = await peer.next("session.created"); peer.send(binaryConfiguration(true)); await peer.next("session.updated");
+    peer.socket.send(Buffer.concat(silenceStream())); peer.send({ type: "input_audio_buffer.commit" }); const committed = await peer.next("input_audio_buffer.committed");
+    expect(await peer.next("conversation.item.input_audio_transcription.failed")).toMatchObject({ item_id: committed.item_id, error: { code: "invalid_audio", message: "Decoded Opus duration does not match the stream's granules.", param: "audio" } });
+    expect(transcribe).not.toHaveBeenCalled();
+    expect(diagnostics).toEqual([{ level: "warn", request_id: expect.stringMatching(/^req_/), fields: { session_id: created.session.id, item_id: committed.item_id, phase: "normalization", code: "invalid_audio", status: 400 }, message: "Realtime compressed audio normalization failed" }]);
+    expect(JSON.stringify(diagnostics)).not.toContain(sensitive); expect(JSON.stringify(diagnostics)).not.toContain(TOKEN);
+    await rm(stub);
+  });
   it("clears transcription hints with documented GA settings before switching models", async () => {
     const { connect } = await boot({}, 2, (config) => {
       const model = config.models.find((entry) => entry.task === "transcription")!;
@@ -107,7 +245,7 @@ describe("Realtime transcription over real WebSockets", () => {
     peer.append(); peer.send({ type: "input_audio_buffer.commit" });
     const committed = await peer.next("input_audio_buffer.committed");
     expect(await peer.next("conversation.item.input_audio_transcription.failed")).toMatchObject({ error: { code: "normalization_failed", param: null } });
-    expect(diagnostics).toContainEqual({ request_id: expect.stringMatching(/^req_/), fields: { session_id: created.session.id, item_id: committed.item_id, phase: "normalization", code: "normalization_failed", status: 500 }, message: "Realtime transcription failed" });
+    expect(diagnostics).toContainEqual({ level: "error", request_id: expect.stringMatching(/^req_/), fields: { session_id: created.session.id, item_id: committed.item_id, phase: "normalization", code: "normalization_failed", status: 500 }, message: "Realtime transcription failed" });
   });
   it("logs safe request/session/item diagnostics for unexpected inference and cleanup failures", async () => {
     const diagnostics: any[] = []; const { connect, registry, config } = await boot({}, 2, undefined, diagnostics);
@@ -116,11 +254,11 @@ describe("Realtime transcription over real WebSockets", () => {
     const sensitive = `private transcript ${TOKEN} ${pcm.toString("base64")}`;
     vi.spyOn(provider, "transcribe").mockRejectedValueOnce(new Error(sensitive));
     peer.append(); peer.send({ type: "input_audio_buffer.commit" }); const first = await peer.next("input_audio_buffer.committed"); await peer.next("conversation.item.input_audio_transcription.failed");
-    expect(diagnostics).toContainEqual({ request_id: expect.stringMatching(/^req_/), fields: { session_id: created.session.id, item_id: first.item_id, phase: "inference", code: "transcription_failed", status: 500 }, message: "Realtime transcription failed" });
+    expect(diagnostics).toContainEqual({ level: "error", request_id: expect.stringMatching(/^req_/), fields: { session_id: created.session.id, item_id: first.item_id, phase: "inference", code: "transcription_failed", status: 500 }, message: "Realtime transcription failed" });
     vi.spyOn(provider, "transcribe").mockImplementationOnce(async ({ path }) => { await rm(path); await mkdir(path); return { text: sensitive }; });
     const closed = once(peer.socket, "close"); peer.append(); peer.send({ type: "input_audio_buffer.commit" }); const second = await peer.next("input_audio_buffer.committed");
     expect((await closed)[0]).toBe(1011);
-    expect(diagnostics).toContainEqual({ request_id: expect.stringMatching(/^req_/), fields: { session_id: created.session.id, item_id: second.item_id, phase: "cleanup", code: "transcription_failed", status: 500 }, message: "Realtime transcription failed" });
+    expect(diagnostics).toContainEqual({ level: "error", request_id: expect.stringMatching(/^req_/), fields: { session_id: created.session.id, item_id: second.item_id, phase: "cleanup", code: "transcription_failed", status: 500 }, message: "Realtime transcription failed" });
     expect(JSON.stringify(diagnostics)).not.toContain(sensitive); expect(JSON.stringify(diagnostics)).not.toContain(TOKEN); expect(JSON.stringify(diagnostics)).not.toContain(pcm.toString("base64"));
     expect(runtime.queue.occupancy).toBe(0); await rm(config.server.temp_directory, { recursive: true, force: true });
   });

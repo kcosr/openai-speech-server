@@ -46,7 +46,33 @@ export async function normalizeUpload(upload: StoredUpload, options: { ffmpeg: s
   if (code !== 0) throw new ApiError(400, "invalid_request_error", "invalid_audio", "Audio could not be decoded.", "file");
   const outputBytes = (await stat(upload.output)).size;
   if (outputBytes >= options.maxOutputBytes) throw new ApiError(413, "invalid_request_error", "decoded_audio_too_large", "Decoded audio exceeds the configured limit.", "file");
-  return { path: upload.output, durationSeconds: Math.max(0, outputBytes - 44) / 32_000 };
+  return { path: upload.output, durationSeconds: await normalizedWaveSamples(upload.output, outputBytes) / 16_000 };
+}
+
+/** ffmpeg writes optional RIFF chunks; file length minus 44 is not PCM duration. */
+async function normalizedWaveSamples(path: string, size: number): Promise<number> {
+  const invalidWave = () => new ApiError(400, "invalid_request_error", "invalid_audio", "Audio normalization did not produce a complete PCM WAV.", "file");
+  const file = await open(path, "r"); const header = Buffer.alloc(16);
+  try {
+    if ((await file.read(header, 0, 12, 0)).bytesRead !== 12 || header.toString("ascii", 0, 4) !== "RIFF" || header.toString("ascii", 8, 12) !== "WAVE") throw invalidWave();
+    let pcmBytes: number | undefined; let format = false; let offset = 12;
+    for (let chunks = 0; offset + 8 <= size && chunks < 64; chunks++) {
+      if ((await file.read(header, 0, 8, offset)).bytesRead !== 8) throw invalidWave();
+      const tag = header.toString("ascii", 0, 4); const bytes = header.readUInt32LE(4);
+      offset += 8;
+      if (offset + bytes > size) throw invalidWave();
+      if (tag === "fmt ") {
+        if (bytes < 16 || (await file.read(header, 0, 16, offset)).bytesRead !== 16 || header.readUInt16LE(0) !== 1 || header.readUInt16LE(2) !== 1 || header.readUInt32LE(4) !== 16000 || header.readUInt16LE(14) !== 16) throw invalidWave();
+        format = true;
+      } else if (tag === "data") {
+        if (pcmBytes !== undefined || bytes % 2) throw invalidWave();
+        pcmBytes = bytes;
+      }
+      offset += bytes + bytes % 2;
+    }
+    if (!format || pcmBytes === undefined || offset !== size) throw invalidWave();
+    return pcmBytes / 2;
+  } finally { await file.close(); }
 }
 
 function matchesContainer(prefix: Buffer, format: Format) {
