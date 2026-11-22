@@ -33,6 +33,19 @@ describe("authorized Realtime model capabilities", () => {
       max_session_seconds: 3600,
     });
     expect(models.find((model: { task: string }) => model.task === "speech")).not.toHaveProperty("realtime");
+    expect(transcription.realtime_extensions).toEqual({ binary_audio_input: { versions: [1], formats: [
+      { type: "audio/pcm", rate: 24000 }, { type: "audio/ogg", codec: "opus" },
+    ] } });
+    expect(models.find((model: { task: string }) => model.task === "speech")).not.toHaveProperty("realtime_extensions");
+  });
+
+  it("advertises Ogg Opus only when the selected model accepts Ogg", async () => {
+    const config = await testConfig(); directory = config.server.temp_directory;
+    config.models.find((entry) => entry.task === "transcription")!.input_formats = ["wav"];
+    app = await buildApp(config, await Authenticator.create(config), new Registry(config));
+    const response = await app.inject({ url: "/v1/audio/capabilities", headers });
+    expect(response.json().data.find((entry: { task: string }) => entry.task === "transcription").realtime_extensions)
+      .toEqual({ binary_audio_input: { versions: [1], formats: [{ type: "audio/pcm", rate: 24000 }] } });
   });
 
   it("reports effective per-model whole-sample limits without exposing unavailable models or raising small limits", async () => {

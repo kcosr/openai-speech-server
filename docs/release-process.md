@@ -43,9 +43,10 @@ git diff --check
 ```
 
 The check includes version validation, TypeScript, application tests, and
-release-helper tests. Tests use deterministic CPU workers and need audio-capable
-ffmpeg; when it is not at `/usr/bin/ffmpeg`, set `OPENAI_SPEECH_FFMPEG` to its
-absolute path. Release-helper tests use disposable Git repositories and a fake
+release-helper tests. Tests use deterministic CPU workers and need ffmpeg with
+the `libopus` encoder and an Opus decoder; check `ffmpeg -encoders` and
+`ffmpeg -decoders`. When it is not at `/usr/bin/ffmpeg`, set
+`OPENAI_SPEECH_FFMPEG` to its absolute path. Release-helper tests use disposable Git repositories and a fake
 GitHub CLI; run them separately with `npm run test:release` when changing helpers.
 
 Record the source revision, commands, platform, results, and limitations in the
